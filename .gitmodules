@@ -4,3 +4,7 @@
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
+[submodule "submodules/sibr-core"]
+	path = submodules/sibr-core
+	url = https://github.com/giangvtr/sibr-core.git
+	branch = win11-rtx1080
