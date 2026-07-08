@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import pytorch3d.ops as ops
 import trimesh
 import igl
 
@@ -42,9 +41,9 @@ class SMPLNN(RigidDeform):
         self.skinning_weights = torch.from_numpy(metadata["skinning_weights"]).float().cuda()
 
     def query_weights(self, xyz):
-        # find the nearest vertex
-        knn_ret = ops.knn_points(xyz.unsqueeze(0), self.smpl_verts.unsqueeze(0))
-        p_idx = knn_ret.idx.squeeze()
+        # find the nearest vertex (replacement for pytorch3d.ops.knn_points)
+        dists = torch.cdist(xyz.unsqueeze(0), self.smpl_verts.unsqueeze(0))  # [1, N, V]
+        p_idx = dists.squeeze(0).argmin(dim=1)  # [N]
         pts_W = self.skinning_weights[p_idx, :]
         return pts_W
 

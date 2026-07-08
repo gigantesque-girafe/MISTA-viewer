@@ -134,8 +134,12 @@ migs.type=cp
 
 ### Evaluation
 
-```bash
+```shell
 python render.py mode=test
+
+# On my Windows
+python render.py mode=test wandb_disable=True appearance_identity=2 load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth"
+
 ```
 
 ### Novel View Synthesis
@@ -163,6 +167,9 @@ migs.use_mars=false \
 dataset.predict_seq= 0 // 0,1,2,3, to try differnt dances
 appearance_identity=0 // 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
 load_ckpt=/path/to/ckpt50000.pth
+
+#on my rtx1080
+python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
 ```
 
 ---
@@ -239,3 +246,20 @@ This project builds upon ideas, datasets, and open-source implementations from:
 * ZJU-MoCap
 
 We sincerely thank the authors of these works for making their research and resources publicly available.
+
+
+---
+## Run VR Application
+
+Predict new pose mode
+```shell
+python render_vr_v1.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+```
+
+Test view
+```shell
+python render_vr_v1.py mode=test dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+```
+
+Note:
+- Apparance identity: 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390

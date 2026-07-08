@@ -29,6 +29,7 @@ from models.importance_analysis.reporter import generate_reports
 MIGS_CLASS_MAP = {
     "cp": CPMIGSModule,
     "tt5d": MISTA,
+    "tt": MISTA,  # some checkpoints label the 5D TT module simply "tt"
 }
 TT_MIGS_TYPES = (
     "tt4d", "tt5d", "tt6d", "tt5d_perblock",

@@ -931,3 +931,7 @@ class TTUltraMIGSModule5D(nn.Module):
         self._ft_opt = None
         for p in self.parameters():
             p.requires_grad = True
+
+
+# Backward-compat alias: scene/__init__.py imports `MISTA`.
+MISTA = TTUltraMIGSModule5D

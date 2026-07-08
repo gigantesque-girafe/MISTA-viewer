@@ -16,7 +16,23 @@ from math import exp
 
 import numpy as np
 import cv2
-from pytorch3d.ops.knn import knn_points
+
+
+def knn_points(p1, p2, K, return_sorted=True):
+    """Replacement for pytorch3d.ops.knn_points (dense, brute-force).
+
+    Args:
+        p1: [B, N, D] query points
+        p2: [B, M, D] reference points
+        K:  number of neighbors
+    Returns:
+        (dists, idx, nn) where dists/idx are [B, N, K] and nn is None
+        (nn is unused by the callers here). dists are squared L2 distances
+        to match pytorch3d's convention.
+    """
+    dists = torch.cdist(p1, p2)  # [B, N, M] Euclidean
+    knn_dists, knn_idx = dists.topk(K, dim=-1, largest=False, sorted=return_sorted)
+    return knn_dists ** 2, knn_idx, None
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()

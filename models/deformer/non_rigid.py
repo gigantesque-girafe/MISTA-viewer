@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import pytorch3d.transforms as tf
 from utils.general_utils import make_subseed, torch_rng_context
 
 from models.network_utils import (HierarchicalPoseEncoder,
@@ -110,7 +109,7 @@ class MLP(NonRigidDeform):
             q1[:, 0] = 1.  # [1,0,0,0] représente l'identité
             delta_rot = delta_rot[:, 1:]
             q2 = gaussians._rotation
-            deformed_gaussians._rotation = tf.quaternion_multiply(q1, q2)
+            deformed_gaussians._rotation = quaternion_multiply(q1, q2)
         else:
             raise ValueError
 
@@ -279,7 +278,7 @@ class HashGridwithMLP(NonRigidDeform):
             q1[:, 0] = 1.
             delta_rot = delta_rot[:, 1:]
             q2 = gaussians._rotation
-            deformed_gaussians._rotation = tf.quaternion_multiply(q1, q2)
+            deformed_gaussians._rotation = quaternion_multiply(q1, q2)
         else:
             raise ValueError
 

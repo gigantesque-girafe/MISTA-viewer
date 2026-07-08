@@ -23,7 +23,11 @@ from scene import GaussianModel, Scene
 from utils.general_utils import Evaluator, PSEvaluator, fix_random
 import torch.nn as nn
 import hydra
-from diagnose import diagnose
+try:
+    from diagnose import diagnose  # optional: only needed for mode=diagnose (file not shipped upstream)
+except ImportError:
+    def diagnose(config):
+        raise RuntimeError("mode=diagnose requires diagnose.py, which is not present in this repo.")
 
 def get_camera_folder_name(view):
     for attr in ["camera_id", "cam_id", "view_id", "uid"]:
@@ -390,6 +394,7 @@ def test(config) -> None:
         migs_type = tmp.get("migs_type", config.migs.type)
         print(f"[CHECKPOINT] Detected migs_type = {migs_type}")
 
+        config.migs.type = migs_type  # override config default so Scene builds the right MIGS module
         config.migs.skip_init_from_tensor = True
 
         # TT-specific shape extraction
@@ -666,7 +671,7 @@ def main(config) -> None:
         entity="badioumaima11-insa-rennes",
         dir=config.exp_dir,
         config=OmegaConf.to_container(config, resolve=True),
-        settings=wandb.Settings(start_method="fork"),
+        settings=wandb.Settings(start_method="spawn"),  # "fork" is Unix-only; Windows supports thread/spawn
     )
 
     # Reproducibility
