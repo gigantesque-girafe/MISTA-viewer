@@ -50,9 +50,9 @@ class BodyModel(nn.Module):
 
         # Mean template vertices
         if v_template is None:
-            v_template = np.repeat(smpl_dict['v_template'][np.newaxis], batch_size, axis=0)
+            v_template = np.repeat(np.array(smpl_dict['v_template'])[np.newaxis], batch_size, axis=0)
         else:
-            v_template = np.repeat(v_template[np.newaxis], batch_size, axis=0)
+            v_template = np.repeat(np.array(v_template)[np.newaxis], batch_size, axis=0)
 
         self.register_buffer('v_template', torch.tensor(v_template, dtype=dtype))
 
@@ -67,7 +67,7 @@ class BodyModel(nn.Module):
             num_betas = num_total_betas
 
         print (smpl_dict['shapedirs'].shape)
-        shapedirs = smpl_dict['shapedirs'][:, :, :num_betas]
+        shapedirs = np.array(smpl_dict['shapedirs'][:, :, :num_betas])
         self.register_buffer('shapedirs', torch.tensor(shapedirs, dtype=dtype))
 
         # Regressor for joint locations given shape - 6890 x 24
@@ -75,7 +75,7 @@ class BodyModel(nn.Module):
 
         # Pose blend shape basis: 6890 x 3 x 207, reshaped to 6890*30 x 207
         if use_posedirs:
-            posedirs = smpl_dict['posedirs']
+            posedirs = np.array(smpl_dict['posedirs'])
             posedirs = posedirs.reshape([posedirs.shape[0] * 3, -1]).T
             self.register_buffer('posedirs', torch.tensor(posedirs, dtype=dtype))
         else:
@@ -87,7 +87,7 @@ class BodyModel(nn.Module):
 
         # LBS weights
         # weights = np.repeat(smpl_dict['weights'][np.newaxis], batch_size, axis=0)
-        weights = smpl_dict['weights']
+        weights = np.array(smpl_dict['weights'])
         self.register_buffer('weights', torch.tensor(weights, dtype=dtype))
 
         if 'trans' in params.keys():
