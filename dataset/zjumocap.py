@@ -114,16 +114,24 @@ class ZJUMoCapDataset(Dataset):
 
         self.data = []
         if split == 'predict' or cfg.freeview:
+            # Dummy GT: predict has no ground truth, and this image/mask is only a
+            # placeholder the caller discards. Take the first file that actually
+            # exists rather than assuming 000000 — CoreView_315/313 have 21 cameras
+            # and index their files from 000001, so a hardcoded 000000 makes
+            # cv2.imread return None and every frame of those subjects raise.
+            dummy_dir = os.path.join(subject_dir, '1')
+            dummy_imgs = sorted(glob.glob(os.path.join(dummy_dir, '*.jpg')))
+            dummy_masks = sorted(glob.glob(os.path.join(dummy_dir, '*.png')))
+            dummy_img = dummy_imgs[0] if dummy_imgs else os.path.join(dummy_dir, '000000.jpg')
+            dummy_mask = dummy_masks[0] if dummy_masks else os.path.join(dummy_dir, '000000.png')
+
             for cam_idx, cam_name in enumerate(cam_names):
                 cam_dir = os.path.join(subject_dir, cam_name)
 
                 for d_idx, f_idx in enumerate(frames):
                     model_file = model_files[d_idx]
-                    # get dummy gt...
-                    # img_file = glob.glob(os.path.join(cam_dir, '*.jpg'))[0]
-                    img_file = os.path.join(subject_dir, '1', '000000.jpg')
-                    # mask_file = glob.glob(os.path.join(cam_dir, '*.png'))[0]
-                    mask_file = os.path.join(subject_dir, '1', '000000.png')
+                    img_file = dummy_img
+                    mask_file = dummy_mask
 
                     self.data.append({
                         'cam_idx': cam_idx,
