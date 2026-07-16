@@ -253,7 +253,11 @@ We sincerely thank the authors of these works for making their research and reso
 
 Predict new pose mode
 ```shell
-python render_vr_v1.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+set KMP_DUPLICATE_LIB_OK=TRUE
+
+python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+
+
 ```
 
 Test view
@@ -263,3 +267,16 @@ python render_vr_v1.py mode=test dataset=migs_multi_zju_5d_mars migs.type=tt5d m
 
 Note:
 - Apparance identity: 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
+
+In second terminal: OpenXR Application for VR Viewer
+```shell
+# Options (in normal shell)
+$env:V42_TIMING=1
+$env:V42_INTEROP=1
+
+submodules\sibr_core\install\bin\SIBR_remoteGaussianOpenXRv4_2_app_rwdi.exe --ip 127.0.0.1 --port 6012
+
+
+```
+
+* Surveille le GPU

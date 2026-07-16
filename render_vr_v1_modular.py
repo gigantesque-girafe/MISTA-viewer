@@ -33,10 +33,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from utils.general_utils import build_rotation
-
-from vr_viewer import VRSource, run_server
-from vr_viewer.colormlp_export import export_color_mlp, view_indep_feat_dim
+from vr_viewer import VRSource, run_server, ColorMLPModule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,40 +54,10 @@ _AXIS_FIX = [[-0.9601507782936096,  0.15131592750549316, -0.2349766492843628],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction — mirrors MISTA ColorMLP.compose_input (view-independent part).
-# These read MISTA's Gaussian data model directly, so they stay in the adapter
-# (not in the pipeline-agnostic vr_viewer package).
+# Covariance placement — rebuild/rotate the packed covariance into the VR frame.
+# The ColorMLP feature-extraction seam now lives in vr_viewer.ColorMLPModule;
+# only this axis-fix-specific helper stays in the adapter.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def extract_view_indep_features(color_mlp, gaussians, camera) -> torch.Tensor:
-    features = gaussians.get_features.squeeze(-1)
-    if getattr(color_mlp, 'use_xyz', False):
-        aabb     = color_mlp.metadata["aabb"]
-        xyz_norm = aabb.normalize(gaussians.get_xyz, sym=True)
-        features = torch.cat([features, xyz_norm], dim=1)
-    if getattr(color_mlp, 'use_cov', False):
-        features = torch.cat([features, gaussians.get_covariance()], dim=1)
-    if getattr(color_mlp, 'use_normal', False):
-        scale  = gaussians._scaling
-        rot    = build_rotation(gaussians._rotation)
-        normal = torch.gather(rot, dim=2,
-            index=scale.argmin(1).reshape(-1, 1, 1).expand(-1, 3, 1)).squeeze(-1)
-        features = torch.cat([features, normal], dim=1)
-    if getattr(color_mlp, 'non_rigid_dim', 0) > 0:
-        features = torch.cat([features, gaussians.non_rigid_feature], dim=1)
-    return features   # [N, K]
-
-
-def extract_R_bwd(gaussians, cano_view_dir: bool) -> torch.Tensor:
-    if cano_view_dir and hasattr(gaussians, 'fwd_transform'):
-        T_fwd = gaussians.fwd_transform
-        R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
-        return R_bwd.reshape(-1, 9).contiguous()
-    N   = gaussians.get_xyz.shape[0]
-    dev = gaussians.get_xyz.device
-    return torch.eye(3, dtype=torch.float32, device=dev)\
-               .unsqueeze(0).expand(N, -1, -1).reshape(N, 9).contiguous()
-
 
 def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
     """
@@ -233,12 +200,38 @@ def build_scene_from_checkpoint(config):
     return scene, migs_type, appearance_id
 
 
-def collect_smpl_frames(dataset) -> list:
+def collect_smpl_frames(dataset, drive_idx: int = 0) -> list:
+    """Collect the driving SMPL frames (poses + cameras) for the animation loop.
+
+    For a multi-person dataset we only want ONE subject's motion: appearance is
+    swapped independently via update_gaussians_from_migs, so every identity is
+    driven by the same sequence. Restricting to a single sub-dataset also avoids
+    walking subjects whose frames are incomplete (e.g. CoreView_315 starts at
+    000001, not 000000) and avoids decoding thousands of GT images that are
+    popped immediately below anyway.
+
+    drive_idx indexes dataset.names — 0:386 1:387 2:377 3:392 4:315 5:394 6:393 7:390.
+    """
+    subs = getattr(dataset, "datasets", None)
+    if subs:
+        idx   = max(0, min(int(drive_idx), len(subs) - 1))
+        names = getattr(dataset, "identities", None)
+        log.info("Driving motion from sub-dataset %d (%s) of %d available.",
+                 idx, names[idx] if names else "?", len(subs))
+        dataset = subs[idx]
+    else:
+        idx = 0
+
     cams = []
     for i in range(len(dataset)):
         cam = dataset[i]
         cam.data.pop('original_image', None)
         cam.data.pop('original_mask', None)
+        # Indexing the sub-dataset directly bypasses the multi-person wrapper that
+        # normally stamps person_id, so set it here.
+        if hasattr(cam, 'data'):
+            cam.data['person_id'] = idx
+            setattr(cam, 'person_id', idx)
         cams.append(cam)
     log.info("Loaded %d animation frames.", len(cams))
     return cams
@@ -249,29 +242,147 @@ def collect_smpl_frames(dataset) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MistaVRSource(VRSource):
-    def __init__(self, scene, smpl_cams, iteration, K, model_bytes, N_max):
+    def __init__(self, scene, smpl_cams, iteration, colormlp, model_bytes, N_max,
+                 identity_id: int = 0, swap_metadata: bool = False):
         self.scene       = scene
         self.converter   = scene.converter
         self.gaussians   = scene.gaussians          # canonical avatar (decoded from MIGS)
-        self.color_mlp   = self.converter.texture
-        self.cano        = bool(getattr(self.color_mlp, 'cano_view_dir', False))
+        self.colormlp    = colormlp                 # vr_viewer.ColorMLPModule
         self.iteration   = iteration
         self.smpl_cams   = smpl_cams
         self.n_frames    = len(smpl_cams)
 
-        self.K           = K
+        self.K           = colormlp.K
         self.model_bytes = model_bytes
         self.N_max       = N_max
-        self.device      = next(self.color_mlp.parameters()).device
+        self.device      = next(colormlp.color_mlp.parameters()).device
 
         self.axis_fix       = torch.tensor(_AXIS_FIX, dtype=torch.float32, device=self.device)
         self.avatar_center0 = None                  # captured on frame 0 of each connection
+
+        # Current appearance identity + a pending request set by the control channel
+        # (see run_server). Applied at the top of produce_frame, between frames, so it
+        # never races the streaming loop's use of self.gaussians.
+        self.identity_id   = int(identity_id)   # whichever main already decoded
+        self.pending_id    = None
+        self.swap_metadata = bool(swap_metadata)
+
+        # Per-identity metadata (AABB, SMPL verts/skinning). The deformers capture
+        # these ONCE at construction, so swapping only the Gaussians leaves every
+        # identity being normalised against the startup subject's AABB — which is
+        # what render.py avoids by rebuilding the scene per appearance_identity.
+        # dataset index i == TT identity i (dataset.names order == TT first-mode order).
+        subs = getattr(scene.test_dataset, "datasets", None)
+        self.metadatas = [d.metadata for d in subs] if subs else None
+        if self.metadatas is not None:
+            log.info("Captured %d per-identity metadata dicts for live switching.",
+                     len(self.metadatas))
+            # The scene built the deformers from datasets[0]'s metadata; if we start
+            # on a different identity they must agree from frame 0.
+            self._apply_metadata(self.identity_id)
+
+    def _apply_metadata(self, idx: int):
+        """Rebind the deformers' metadata-derived state to identity `idx`.
+
+        Only the attributes actually read on the inference path are swapped: the
+        AABB used to normalise canonical xyz (non-rigid hashgrid + rigid skinning
+        field), plus the SMPL verts/skinning weights some rigid deformers hold.
+        The network weights are shared across identities and are left alone.
+        """
+        # OFF by default: training built the deformers from datasets[0]'s metadata
+        # (386) and used that AABB for ALL identities, so the hashgrid learned
+        # 386-normalised coordinates. Swapping in another subject's AABB therefore
+        # contradicts the training condition. Kept behind a flag for A/B testing.
+        if not self.swap_metadata:
+            return
+        if self.metadatas is None or not (0 <= idx < len(self.metadatas)):
+            return
+        md = self.metadatas[idx]
+        deformer = self.converter.deformer
+
+        for mod in (getattr(deformer, "non_rigid", None), getattr(deformer, "rigid", None)):
+            if mod is None:
+                continue
+            if hasattr(mod, "aabb") and "aabb" in md:
+                # AABB is an nn.Module (registered buffers); it only reaches CUDA by
+                # being a child of the deformer when .cuda() ran at build time. A
+                # freshly-bound one from raw metadata is still on CPU -> move it.
+                mod.aabb = md["aabb"].to(self.device)
+            for key, attr in (("smpl_verts", "smpl_verts"),
+                              ("skinning_weights", "skinning_weights"),
+                              ("cano_mesh", "cano_mesh")):
+                if hasattr(mod, attr) and key in md:
+                    cur = getattr(mod, attr)
+                    val = md[key]
+                    # Match however the module stored it (tensor on GPU vs raw numpy).
+                    if torch.is_tensor(cur) and not torch.is_tensor(val):
+                        val = torch.from_numpy(val).float().to(cur.device)
+                    setattr(mod, attr, val)
+
+        deformer.metadata = md
+        if hasattr(self.colormlp.color_mlp, "metadata"):
+            self.colormlp.color_mlp.metadata = md
+
+    @property
+    def num_identities(self):
+        migs = getattr(self.scene, "migs_module", None)
+        return int(getattr(migs, "num_identities", 1)) if migs is not None else 1
+
+    def switch_identity(self, new_id: int):
+        """Hot-swap the canonical avatar to a different MIGS identity.
+
+        Cheap because identity lives entirely in the per-Gaussian tensors that
+        update_gaussians_from_migs reassigns in place: G and N_max are fixed, and
+        the Color MLP is identity-agnostic so model_bytes never change (no re-export,
+        no client re-handshake).
+        """
+        new_id = max(0, min(int(new_id), self.num_identities - 1))
+        if new_id == self.identity_id:
+            return
+        log.info("Switching identity %d -> %d", self.identity_id, new_id)
+
+        with torch.no_grad():
+            xyz_old  = self.scene.gaussians._xyz.clone()
+            feat_old = self.scene.gaussians.get_features.clone()
+            self.scene.update_gaussians_from_migs(new_id)
+            xyz_new  = self.scene.gaussians._xyz
+            feat_new = self.scene.gaussians.get_features
+
+            # Per-element relative change. Aggregate mean/std can look identical for
+            # two totally different avatars, so measure the actual difference.
+            def _rel(a, b):
+                return (b - a).norm().item() / max(a.norm().item(), 1e-12)
+
+            xyz_rel  = _rel(xyz_old,  xyz_new)
+            feat_rel = _rel(feat_old, feat_new)
+            # Cosine between the flattened colour features of the two identities.
+            fo, fn = feat_old.flatten(), feat_new.flatten()
+            cos = float(torch.dot(fo, fn) / (fo.norm() * fn.norm() + 1e-12))
+
+        log.info("[DIAG] canonical change %d -> %d:  xyz rel=%.4f   features rel=%.4f   "
+                 "feature cosine=%.4f", self.identity_id, new_id, xyz_rel, feat_rel, cos)
+
+        # The Gaussians alone are not the identity: the deformers must be normalised
+        # against THIS subject's AABB or the hashgrid produces the wrong non-rigid
+        # features (16 of the 48 colour inputs) -> right shape, wrong colours.
+        self._apply_metadata(new_id)
+
+        self.gaussians      = self.scene.gaussians   # same object, rebind for clarity
+        self.identity_id    = new_id
+        self.avatar_center0 = None                   # re-pin new body to world origin
+        self._diag_frames   = 2                      # log the next 2 produced frames
 
     def on_connect(self):
         # Re-pin the avatar start to world origin for each fresh viewer connection.
         self.avatar_center0 = None
 
     def produce_frame(self, frame_idx: int):
+        # Apply any pending identity switch here, between frames — safe w.r.t. the
+        # streaming loop which only calls produce_frame serially.
+        if self.pending_id is not None:
+            self.switch_identity(self.pending_id)
+            self.pending_id = None
+
         cam = self.smpl_cams[frame_idx % self.n_frames]
 
         with torch.no_grad():
@@ -282,9 +393,26 @@ class MistaVRSource(VRSource):
             )
             torch.cuda.synchronize()
 
-            # ── View-independent feature extraction ──────────────────────────
-            feat    = extract_view_indep_features(self.color_mlp, deformed_pc, cam_c)
-            R_bwd_f = extract_R_bwd(deformed_pc, self.cano)
+            # ── View-independent feature extraction (ColorMLP seam) ──────────
+            feat    = self.colormlp.features(deformed_pc)
+            R_bwd_f = self.colormlp.R_bwd(deformed_pc)
+
+            # Post-switch diagnostic: does the identity signal survive the deformer
+            # and reach the tensor we actually put on the wire? feat is
+            # [base_features | non_rigid]; the base half is the identity-specific
+            # part, so log the two halves separately.
+            if getattr(self, "_diag_frames", 0) > 0:
+                self._diag_frames -= 1
+                base_dim = feat.shape[1] - int(getattr(self.colormlp.color_mlp,
+                                                       'non_rigid_dim', 0))
+                log.info("[DIAG] id=%d deformed_pc.get_features mean=%+.5f | "
+                         "feat[:, :%d] (identity) mean=%+.5f std=%.5f | "
+                         "feat[:, %d:] (non-rigid) mean=%+.5f",
+                         self.identity_id,
+                         deformed_pc.get_features.mean().item(),
+                         base_dim, feat[:, :base_dim].mean().item(),
+                         feat[:, :base_dim].std().item(),
+                         base_dim, feat[:, base_dim:].mean().item())
 
             # ── Placement (axis fix + origin pin) ────────────────────────────
             xyz = deformed_pc.get_xyz @ self.axis_fix.T
@@ -368,9 +496,19 @@ def main(config: DictConfig):
     scene, migs_type, appearance_id = build_scene_from_checkpoint(config)
     iteration = config.opt.iterations
 
-    # ── Decode the canonical Gaussians from the MIGS factorization ONCE ───────
-    smpl_cams = collect_smpl_frames(scene.test_dataset)
-    if appearance_id is not None:
+    # ── Driving motion: one subject's sequence; appearance is switched live ───
+    # NOTE: do NOT set appearance_identity to pick the avatar — it filters the
+    # multi-person dataset down to that subject, which makes datasets[0] (and
+    # therefore the shared metadata: AABB + SMPL betas) come from the wrong
+    # person. The model is trained with datasets[0] = 386 as the canonical frame,
+    # so the full list must load. Use drive_identity for the motion source and
+    # start_identity for the initial avatar instead.
+    drive_idx = int(config.get("drive_identity", 0))
+    smpl_cams = collect_smpl_frames(scene.test_dataset, drive_idx)
+
+    if config.get("start_identity", None) is not None:
+        identity_id = int(config.start_identity)
+    elif appearance_id is not None:
         identity_id = int(appearance_id)
     else:
         identity_id = int(getattr(smpl_cams[0], "person_id", 0))
@@ -379,20 +517,22 @@ def main(config: DictConfig):
         scene.update_gaussians_from_migs(identity_id)
     log.info("Canonical avatar ready: %d Gaussians.", scene.gaussians.get_xyz.shape[0])
 
-    # ── Color-MLP export + feature dim (generic helper from vr_viewer) ────────
+    # ── Color-MLP module (feature dim + export live in vr_viewer) ─────────────
     color_mlp = scene.converter.texture
     device    = next(color_mlp.parameters()).device
 
-    K = view_indep_feat_dim(color_mlp)
-    log.info("Feature dim K=%d. Tracing Color MLP...", K)
-    model_bytes = export_color_mlp(color_mlp, K, device)
+    colormlp = ColorMLPModule(color_mlp)
+    log.info("Feature dim K=%d. Tracing Color MLP...", colormlp.K)
+    model_bytes = colormlp.export(device)
     log.info("TorchScript model: %d bytes.", len(model_bytes))
 
     N_max = int(config.get("gaussians_vr", {}).get("n_max", _N_MAX))
     port  = int(config.get("gaussians_vr", {}).get("port", _PORT))
 
     # ── Hand off to the reusable, pipeline-agnostic streaming loop ────────────
-    source = MistaVRSource(scene, smpl_cams, iteration, K, model_bytes, N_max)
+    source = MistaVRSource(scene, smpl_cams, iteration, colormlp, model_bytes, N_max,
+                           identity_id=identity_id,
+                           swap_metadata=bool(config.get("swap_metadata", False)))
     run_server(source, port=port)
 
 

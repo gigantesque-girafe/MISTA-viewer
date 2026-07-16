@@ -4,7 +4,7 @@ dataset_name: zju_315_mono
 
 dataset:
   name: zjumocap
-  root_dir: "C:/Users/travu/MISTA/data/ZJUMoCap/"
+  root_dir: "C:/Users/travu/dataMISTA/newZJUMocap/"
   subject: CoreView_315
   refine: false
 

@@ -707,6 +707,11 @@ class TTUltraMIGSModule5D(nn.Module):
         return X @ C4
 
 
+    @property
+    def num_identities(self) -> int:
+        """Number of identities I stored in the TT factorization (first TT mode)."""
+        return int(self.tt_tensor_gpu[0].shape[1])
+
     def get_W_for_identity(self, idx: int, original_order: bool = True) -> torch.Tensor:
         """Return (G, M) for identity idx; optionally undo spatial permutation."""
         try:

@@ -22,9 +22,11 @@ training code is never touched.
 from .server import VRSource, run_server
 from .protocol import HANDSHAKE, DEFAULT_PORT
 from .ipc import GaussianAttrBuffer, GaussianIPCManager
+from .colormlp_export import ColorMLPModule
 
 __all__ = [
     "VRSource", "run_server",
     "HANDSHAKE", "DEFAULT_PORT",
     "GaussianAttrBuffer", "GaussianIPCManager",
+    "ColorMLPModule",
 ]

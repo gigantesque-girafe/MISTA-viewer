@@ -22,7 +22,7 @@ import logging
 import torch
 
 from .ipc import GaussianAttrBuffer, GaussianIPCManager
-from .protocol import do_handshake, DEFAULT_PORT
+from .protocol import do_handshake, poll_control, CTRL_SET_IDENTITY, DEFAULT_PORT
 
 log = logging.getLogger("vr_viewer.server")
 
@@ -54,6 +54,11 @@ class VRSource:
     K: int
     model_bytes: bytes
     n_frames: int
+
+    # Set by the server's control channel (poll_control); a subclass that supports
+    # live identity switching consumes this at the top of produce_frame. Sources
+    # that ignore it are unaffected.
+    pending_id = None
 
     def produce_frame(self, frame_idx: int):
         raise NotImplementedError
@@ -116,6 +121,16 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
 
                 while True:
                     t0 = time.perf_counter()
+
+                    # ── Client -> server control messages (e.g. GUI identity switch).
+                    # Non-blocking; sets a pending request the source applies at the
+                    # top of its next produce_frame (between frames, no race).
+                    for magic, payload in poll_control(conn):
+                        if magic == CTRL_SET_IDENTITY:
+                            log.info("[CTRL] set identity -> %d", payload)
+                            source.pending_id = payload
+                        else:
+                            log.warning("[CTRL] unknown control magic %r", magic)
 
                     # ── FREEZE diagnostic: keep the socket + C++ rendering alive,
                     # but do ZERO GPU work — just re-announce the last good buffer.
