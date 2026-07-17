@@ -31,7 +31,6 @@ import os
 import logging
 
 import torch
-import torch.nn as nn
 
 from utils.general_utils import build_rotation
 
@@ -40,6 +39,8 @@ from vr_viewer.colormlp_export import export_color_mlp
 # vr_viewer privatised this helper when ColorMLPModule was added; this adapter
 # predates that refactor and only needs the dim calculation, not the wrapper.
 from vr_viewer.colormlp_export import _view_indep_feat_dim as view_indep_feat_dim
+
+from render import build_scene
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,118 +123,10 @@ def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MISTA checkpoint loading — reproduces render.py predict()'s "extra start steps".
-# Builds the Scene, allocates TT/CP cores from the checkpoint shapes, loads weights
-# and the converter state. Returns (scene, migs_type, appearance_id).
+# MISTA checkpoint loading now lives in render.build_scene(), shared verbatim
+# with predict() and the other viewer adapters — it is imported below, not
+# reimplemented here.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def build_scene_from_checkpoint(config):
-    from scene import GaussianModel, Scene
-
-    load_ckpt = config.get("load_ckpt", None)
-    if load_ckpt is None:
-        raise ValueError("Please provide load_ckpt.")
-
-    log.info("Loading checkpoint: %s", load_ckpt)
-    tmp = torch.load(load_ckpt, map_location="cpu")
-    sd  = tmp["migs_module_state_dict"]
-
-    migs_type = tmp.get("migs_type", config.migs.type)
-    log.info("Detected migs_type = %s", migs_type)
-    config.migs.type = migs_type
-
-    appearance_id = getattr(config, "appearance_identity", None)
-
-    # CASE 1: CP / Tucker — plain checkpoint loading.
-    if migs_type in ("cp", "tucker"):
-        config.migs.skip_init_from_tensor = False
-        gaussians = GaussianModel(config.model.gaussian)
-        scene = Scene(config, gaussians, config.exp_dir)
-        scene.appearance_identity = appearance_id
-        scene.eval()
-        scene.load_checkpoint(load_ckpt)
-        log.info("CP/Tucker checkpoint loaded")
-        return scene, migs_type, appearance_id
-
-    # CASE 2: TT (tt5d / tt / MARS-wrapped) — allocate cores from checkpoint shapes.
-    has_mars_prefix = any(k.startswith("tensorized_model.tt.") for k in sd.keys())
-    prefix = "tensorized_model.tt." if has_mars_prefix else ""
-    if has_mars_prefix:
-        log.info("Detected MARS-wrapped checkpoint")
-
-    r1 = sd[f"{prefix}tt_tensor_gpu.0"].shape[-1]
-    r2 = sd[f"{prefix}tt_tensor_gpu.1"].shape[-1]
-    r3 = sd[f"{prefix}tt_tensor_gpu.2"].shape[-1]
-    r4 = sd[f"{prefix}tt_tensor_gpu.3"].shape[-1]
-    config.migs.rank = [1, r1, r2, r3, r4, 1]
-
-    n_id = sd[f"{prefix}tt_tensor_gpu.0"].shape[1]
-    n1   = sd[f"{prefix}tt_tensor_gpu.1"].shape[1]
-    n2   = sd[f"{prefix}tt_tensor_gpu.2"].shape[1]
-    n3   = sd[f"{prefix}tt_tensor_gpu.3"].shape[1]
-
-    try:
-        M_xyz = sd[f"{prefix}core4_xyz"].shape[1]
-        M_scl = sd[f"{prefix}core4_scaling"].shape[1]
-        M_rot = sd[f"{prefix}core4_rotation"].shape[1]
-        M_dc  = sd[f"{prefix}core4_dc"].shape[1]
-        M_rst = sd[f"{prefix}core4_rest"].shape[1]
-        M_opa = sd[f"{prefix}core4_opacity"].shape[1]
-        M = M_xyz + M_scl + M_rot + M_dc + M_rst + M_opa
-    except KeyError:
-        M_xyz, M_scl, M_rot, M_dc, M_rst, M_opa = 3, 3, 4, 1, 31, 1
-        M = 43
-
-    config.migs.tt_shape = [n_id, n1, n2, n3, M]
-    config.migs.n_identities_ckpt = int(n_id)
-    config.migs.use_mars = False
-    config.migs.skip_init_from_tensor = True
-
-    log.info("rank     = %s", config.migs.rank)
-    log.info("tt_shape = %s", config.migs.tt_shape)
-
-    if has_mars_prefix:
-        sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-
-    gaussians = GaussianModel(config.model.gaussian)
-    scene = Scene(config, gaussians, config.exp_dir)
-    scene.appearance_identity = appearance_id
-    scene.eval()
-
-    tt_module = scene.migs_module
-    tt_module.tt_shape = tuple(config.migs.tt_shape)
-    tt_module.tt_rank  = config.migs.rank
-
-    device = "cuda"
-    tt_module.tt_tensor_gpu = nn.ParameterList([
-        nn.Parameter(torch.zeros(1,  n_id, r1, device=device)),
-        nn.Parameter(torch.zeros(r1, n1,   r2, device=device)),
-        nn.Parameter(torch.zeros(r2, n2,   r3, device=device)),
-        nn.Parameter(torch.zeros(r3, n3,   r4, device=device)),
-    ])
-    tt_module.core4_xyz      = nn.Parameter(torch.zeros(r4, M_xyz, 1, device=device))
-    tt_module.core4_scaling  = nn.Parameter(torch.zeros(r4, M_scl, 1, device=device))
-    tt_module.core4_rotation = nn.Parameter(torch.zeros(r4, M_rot, 1, device=device))
-    tt_module.core4_dc       = nn.Parameter(torch.zeros(r4, M_dc,  1, device=device))
-    tt_module.core4_rest     = nn.Parameter(torch.zeros(r4, M_rst, 1, device=device))
-    tt_module.core4_opacity  = nn.Parameter(torch.zeros(r4, M_opa, 1, device=device))
-
-    G = n1 * n2 * n3
-    tt_module.register_buffer("perm",     torch.arange(G, dtype=torch.long, device=device))
-    tt_module.register_buffer("inv_perm", torch.arange(G, dtype=torch.long, device=device))
-    log.info("TT cores allocated (G=%d)", G)
-
-    missing, unexpected = tt_module.load_state_dict(sd, strict=False)
-    if missing:
-        log.info("Missing keys   : %s%s", missing[:5], '...' if len(missing) > 5 else '')
-    if unexpected:
-        log.info("Unexpected keys: %s%s", unexpected[:5], '...' if len(unexpected) > 5 else '')
-    log.info("TT weights loaded")
-
-    scene.converter.load_state_dict(tmp["converter_state"])
-    log.info("Converter loaded")
-
-    return scene, migs_type, appearance_id
 
 
 def collect_smpl_frames(dataset) -> list:
@@ -368,7 +261,7 @@ def main(config: DictConfig):
     fix_random(config.seed)
 
     # ── Extra MISTA start steps: load factorized checkpoint & build scene ─────
-    scene, migs_type, appearance_id = build_scene_from_checkpoint(config)
+    scene, migs_type, appearance_id = build_scene(config)
     iteration = config.opt.iterations
 
     # ── Decode the canonical Gaussians from the MIGS factorization ONCE ───────

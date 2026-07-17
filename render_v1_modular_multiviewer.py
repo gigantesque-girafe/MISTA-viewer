@@ -46,9 +46,10 @@ import os
 import logging
 
 import torch
-import torch.nn as nn
 
 from vr_viewer import VRSource, run_server, ColorMLPModule
+
+from render import build_scene
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,119 +102,10 @@ def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MISTA checkpoint loading — reproduces render.py predict()'s "extra start steps".
-# Builds the Scene, allocates TT/CP cores from the checkpoint shapes, loads weights
-# and the converter state. Returns (scene, migs_type, appearance_id).
+# MISTA checkpoint loading now lives in render.build_scene(), shared verbatim
+# with predict() and the other viewer adapters — it is imported above, not
+# reimplemented here.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def build_scene_from_checkpoint(config):
-    from scene import GaussianModel, Scene
-
-    load_ckpt = config.get("load_ckpt", None)
-    if load_ckpt is None:
-        raise ValueError("Please provide load_ckpt.")
-
-    log.info("Loading checkpoint: %s", load_ckpt)
-    tmp = torch.load(load_ckpt, map_location="cpu")
-    sd  = tmp["migs_module_state_dict"]
-
-    migs_type = tmp.get("migs_type", config.migs.type)
-    log.info("Detected migs_type = %s", migs_type)
-    config.migs.type = migs_type
-
-    appearance_id = getattr(config, "appearance_identity", None)
-
-    # CASE 1: CP / Tucker — plain checkpoint loading.
-    if migs_type in ("cp", "tucker"):
-        config.migs.skip_init_from_tensor = False
-        gaussians = GaussianModel(config.model.gaussian)
-        scene = Scene(config, gaussians, config.exp_dir)
-        scene.appearance_identity = appearance_id
-        scene.eval()
-        scene.load_checkpoint(load_ckpt)
-        log.info("CP/Tucker checkpoint loaded")
-        return scene, migs_type, appearance_id
-
-    # CASE 2: TT (tt5d / tt / MARS-wrapped) — allocate cores from checkpoint shapes.
-    has_mars_prefix = any(k.startswith("tensorized_model.tt.") for k in sd.keys())
-    prefix = "tensorized_model.tt." if has_mars_prefix else ""
-    if has_mars_prefix:
-        log.info("Detected MARS-wrapped checkpoint")
-
-    r1 = sd[f"{prefix}tt_tensor_gpu.0"].shape[-1]
-    r2 = sd[f"{prefix}tt_tensor_gpu.1"].shape[-1]
-    r3 = sd[f"{prefix}tt_tensor_gpu.2"].shape[-1]
-    r4 = sd[f"{prefix}tt_tensor_gpu.3"].shape[-1]
-    config.migs.rank = [1, r1, r2, r3, r4, 1]
-
-    n_id = sd[f"{prefix}tt_tensor_gpu.0"].shape[1]
-    n1   = sd[f"{prefix}tt_tensor_gpu.1"].shape[1]
-    n2   = sd[f"{prefix}tt_tensor_gpu.2"].shape[1]
-    n3   = sd[f"{prefix}tt_tensor_gpu.3"].shape[1]
-
-    try:
-        M_xyz = sd[f"{prefix}core4_xyz"].shape[1]
-        M_scl = sd[f"{prefix}core4_scaling"].shape[1]
-        M_rot = sd[f"{prefix}core4_rotation"].shape[1]
-        M_dc  = sd[f"{prefix}core4_dc"].shape[1]
-        M_rst = sd[f"{prefix}core4_rest"].shape[1]
-        M_opa = sd[f"{prefix}core4_opacity"].shape[1]
-        M = M_xyz + M_scl + M_rot + M_dc + M_rst + M_opa
-    except KeyError:
-        M_xyz, M_scl, M_rot, M_dc, M_rst, M_opa = 3, 3, 4, 1, 31, 1
-        M = 43
-
-    config.migs.tt_shape = [n_id, n1, n2, n3, M]
-    config.migs.n_identities_ckpt = int(n_id)
-    config.migs.use_mars = False
-    config.migs.skip_init_from_tensor = True
-
-    log.info("rank     = %s", config.migs.rank)
-    log.info("tt_shape = %s", config.migs.tt_shape)
-
-    if has_mars_prefix:
-        sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-
-    gaussians = GaussianModel(config.model.gaussian)
-    scene = Scene(config, gaussians, config.exp_dir)
-    scene.appearance_identity = appearance_id
-    scene.eval()
-
-    tt_module = scene.migs_module
-    tt_module.tt_shape = tuple(config.migs.tt_shape)
-    tt_module.tt_rank  = config.migs.rank
-
-    device = "cuda"
-    tt_module.tt_tensor_gpu = nn.ParameterList([
-        nn.Parameter(torch.zeros(1,  n_id, r1, device=device)),
-        nn.Parameter(torch.zeros(r1, n1,   r2, device=device)),
-        nn.Parameter(torch.zeros(r2, n2,   r3, device=device)),
-        nn.Parameter(torch.zeros(r3, n3,   r4, device=device)),
-    ])
-    tt_module.core4_xyz      = nn.Parameter(torch.zeros(r4, M_xyz, 1, device=device))
-    tt_module.core4_scaling  = nn.Parameter(torch.zeros(r4, M_scl, 1, device=device))
-    tt_module.core4_rotation = nn.Parameter(torch.zeros(r4, M_rot, 1, device=device))
-    tt_module.core4_dc       = nn.Parameter(torch.zeros(r4, M_dc,  1, device=device))
-    tt_module.core4_rest     = nn.Parameter(torch.zeros(r4, M_rst, 1, device=device))
-    tt_module.core4_opacity  = nn.Parameter(torch.zeros(r4, M_opa, 1, device=device))
-
-    G = n1 * n2 * n3
-    tt_module.register_buffer("perm",     torch.arange(G, dtype=torch.long, device=device))
-    tt_module.register_buffer("inv_perm", torch.arange(G, dtype=torch.long, device=device))
-    log.info("TT cores allocated (G=%d)", G)
-
-    missing, unexpected = tt_module.load_state_dict(sd, strict=False)
-    if missing:
-        log.info("Missing keys   : %s%s", missing[:5], '...' if len(missing) > 5 else '')
-    if unexpected:
-        log.info("Unexpected keys: %s%s", unexpected[:5], '...' if len(unexpected) > 5 else '')
-    log.info("TT weights loaded")
-
-    scene.converter.load_state_dict(tmp["converter_state"])
-    log.info("Converter loaded")
-
-    return scene, migs_type, appearance_id
-
 
 def collect_identity_poses(dataset) -> dict:
     """Capture one reference pose (`rots`/`Jtrs`) per identity.
@@ -222,10 +114,17 @@ def collect_identity_poses(dataset) -> dict:
     TT identity core (non_rigid.HashGridwithMLP conditions its field on
     pose_encoder(rots, Jtrs), and that field feeds the ColorMLP). Each subject was
     trained on a disjoint pose distribution, so the network reads identity off
-    `rots`. Feeding identity N's rots while keeping the driving frame's
-    bone_transforms gives N's appearance on the shared motion.
+    `rots`: identity N's rots act as N's "password" to the colour path.
 
-    dataset index i == TT identity i.
+    PASS THE TRAIN DATASET, not the predict/test one. This only works if each
+    identity's reference pose comes from that subject's OWN motion (the `models`
+    folder, which the train split always uses). The predict sequences 2..5 are a
+    SHARED AIST dance whose pose_body/root_orient are bit-identical across subjects
+    — capturing from those yields the same `rots` for everyone, so every identity
+    gets the same colour and the whole mechanism silently does nothing.
+
+    dataset index i == TT identity i, which holds for the train split (no subject is
+    skipped there); it does NOT hold for predict_seq=2, where 315/390 are missing.
     """
     subs = getattr(dataset, "datasets", None)
     if not subs:
@@ -249,6 +148,18 @@ def collect_identity_poses(dataset) -> dict:
             log.warning("No loadable frame for identity %d (%s); it will render with "
                         "the driving subject's appearance.",
                         i, names[i] if names else "?")
+
+    # Guard against the trap above: if the captured poses do not actually differ,
+    # they cannot select anything and every avatar will look the same.
+    ids = sorted(poses)
+    if len(ids) > 1:
+        ref = poses[ids[0]]['rots']
+        if all(torch.equal(poses[i]['rots'], ref) for i in ids[1:]):
+            log.error("Reference poses are IDENTICAL across identities — the colour "
+                      "selector will do nothing. This happens when they are captured "
+                      "from a shared sequence (predict_seq=2..5). Pass the train "
+                      "dataset instead.")
+
     log.info("Captured reference poses for %d/%d identities.", len(poses), len(subs))
     return poses
 
@@ -321,23 +232,68 @@ class MistaVRSource(VRSource):
         # What actually selects the rendered appearance (measured, not assumed):
         # the pose condition `rots`. non_rigid.HashGridwithMLP computes
         #     pose_feat = pose_encoder(rots, Jtrs)
-        # and conditions its field on it; that field's output is the non_rigid half
-        # of the ColorMLP input. Each ZJU subject trains on a disjoint pose
+        # and conditions its field on it. Each ZJU subject trains on a disjoint pose
         # distribution, so the model learned to read identity off `rots` rather than
         # off the TT identity core — swapping the core alone leaves the avatar
-        # wearing the driving subject's clothes. Overriding `rots` per identity is
-        # therefore what makes the button work, and it leaves the rigid deformer
-        # (which consumes bone_transforms) free to follow the driving motion.
+        # wearing the driving subject's clothes.
+        #
+        # The field has TWO output heads from that one forward pass:
+        #     delta_xyz / delta_scale / delta_rot -> wrinkle GEOMETRY
+        #     non_rigid_feature (16 dims)         -> the only part ColorMLP sees
+        # so it can be evaluated twice with different `rots` and each head taken from
+        # the run that suits it: the live driving pose for geometry (wrinkles keep
+        # reacting), this identity's reference pose for colour (identity stays right).
+        # The colour half is constant between switches — reference `rots` and the
+        # canonical xyz both fixed — so it is cached per identity and costs nothing
+        # per frame. What is given up is pose-dependent *shading*, not wrinkle motion.
         self.identity_poses = identity_poses or {}
-        self._pose_override = self.identity_poses.get(self.identity_id)
         if self.identity_poses:
             log.info("Captured reference poses for identities: %s",
                      sorted(self.identity_poses))
+        self._identity_nr_feature = self._compute_identity_nr_feature(self.identity_id)
 
     @property
     def num_identities(self):
         migs = getattr(self.scene, "migs_module", None)
         return int(getattr(migs, "num_identities", 1)) if migs is not None else 1
+
+    def _compute_identity_nr_feature(self, idx: int):
+        """The non-rigid feature for identity `idx` under ITS OWN reference pose.
+
+        This is the tensor that carries the identity into the ColorMLP. It depends
+        only on the canonical Gaussians (fixed between switches) and the reference
+        `rots`/`Jtrs` (fixed per identity), so it is computed once here rather than
+        every frame. self.gaussians must already hold identity `idx` when called.
+
+        Returns None when no reference pose is available, in which case produce_frame
+        leaves the live feature alone and appearance follows the driving subject.
+        """
+        override = self.identity_poses.get(idx)
+        non_rigid = getattr(self.converter.deformer, "non_rigid", None)
+        if override is None or non_rigid is None:
+            return None
+        if not self.smpl_cams:
+            return None
+
+        # A throwaway camera carrying the reference pose. Only rots/Jtrs are read by
+        # the non-rigid field, but pose_correction is applied for parity with the
+        # live path so both see the same kind of (corrected) pose.
+        cam = self.smpl_cams[0].copy()
+        cam.data.update(override)
+        try:
+            with torch.no_grad():
+                cam_c, _ = self.converter.pose_correction(cam, self.iteration)
+                nr_pc, _ = non_rigid(self.gaussians, self.iteration, cam_c,
+                                     compute_loss=False)
+            feat = getattr(nr_pc, "non_rigid_feature", None)
+        except Exception as e:
+            log.warning("Could not precompute the identity colour feature for %d (%s); "
+                        "appearance will follow the driving subject.", idx, e)
+            return None
+        if feat is None:
+            return None
+        log.info("Cached identity colour feature for %d: %s", idx, tuple(feat.shape))
+        return feat.clone()
 
     def switch_identity(self, new_id: int):
         """Hot-swap the canonical avatar to a different MIGS identity.
@@ -355,14 +311,17 @@ class MistaVRSource(VRSource):
         with torch.no_grad():
             self.scene.update_gaussians_from_migs(new_id)
 
+        self.gaussians = self.scene.gaussians        # same object, rebind for clarity
+
         # The canonical Gaussians carry only part of the identity — the visible
-        # appearance rides on the pose condition (see __init__). Swap both.
-        self._pose_override = self.identity_poses.get(new_id)
-        if self._pose_override is None and self.identity_poses:
+        # appearance rides on the pose condition (see __init__), so recache the
+        # colour feature under the NEW identity's reference pose. Must come after
+        # update_gaussians_from_migs, since it reads self.gaussians.
+        self._identity_nr_feature = self._compute_identity_nr_feature(new_id)
+        if self._identity_nr_feature is None and self.identity_poses:
             log.warning("No reference pose for identity %d; appearance will follow "
                         "the driving subject.", new_id)
 
-        self.gaussians      = self.scene.gaussians   # same object, rebind for clarity
         self.identity_id    = new_id
         self.avatar_center0 = None                   # re-pin new body to world origin
 
@@ -381,23 +340,22 @@ class MistaVRSource(VRSource):
 
         with torch.no_grad():
             # ── Deformation ──────────────────────────────────────────────────
-            # Hand the pose-conditioned non-rigid field (and hence the ColorMLP)
-            # this identity's `rots`, which is what actually selects the rendered
-            # appearance. bone_transforms is left alone, so the rigid deformer
-            # still follows the driving motion and the body animates normally.
-            # smpl_cams are reused every loop, so restore afterwards.
-            saved = None
-            if self._pose_override is not None:
-                saved = {k: cam.data[k] for k in self._pose_override}
-                cam.data.update(self._pose_override)
-            try:
-                cam_c, _ = self.converter.pose_correction(cam, self.iteration)
-                deformed_pc, _ = self.converter.deformer(
-                    self.gaussians, cam_c, self.iteration, compute_loss=False
-                )
-            finally:
-                if saved is not None:
-                    cam.data.update(saved)
+            # Driven entirely by the live pose, so the rigid skinning AND the
+            # non-rigid wrinkle deltas both follow the motion normally.
+            cam_c, _ = self.converter.pose_correction(cam, self.iteration)
+            deformed_pc, _ = self.converter.deformer(
+                self.gaussians, cam_c, self.iteration, compute_loss=False
+            )
+
+            # ── Identity ─────────────────────────────────────────────────────
+            # Colour is the one thing the live pose gets wrong: the model reads
+            # identity off `rots`, so under a foreign (or shared) driving sequence
+            # every avatar would wear the driving subject's clothes. Swap in the
+            # feature precomputed under THIS identity's reference pose. ColorMLP
+            # reads non_rigid_feature and nothing else from the non-rigid field, so
+            # the geometry above keeps the live deltas untouched.
+            if self._identity_nr_feature is not None:
+                deformed_pc.non_rigid_feature = self._identity_nr_feature
             torch.cuda.synchronize()
 
             # ── View-independent feature extraction (ColorMLP seam) ──────────
@@ -496,7 +454,7 @@ def main(config: DictConfig):
     fix_random(config.seed)
 
     # ── Extra MISTA start steps: load factorized checkpoint & build scene ─────
-    scene, migs_type, appearance_id = build_scene_from_checkpoint(config)
+    scene, migs_type, appearance_id = build_scene(config)
     iteration = config.opt.iterations
 
     # ── Driving motion: one subject's sequence; appearance is switched live ───
@@ -507,7 +465,11 @@ def main(config: DictConfig):
     # initial avatar instead.
     drive_idx = int(config.get("drive_identity", 0))
     smpl_cams = collect_smpl_frames(scene.test_dataset, drive_idx)
-    identity_poses = collect_identity_poses(scene.test_dataset)
+    # Reference poses come from the TRAIN dataset (each subject's own `models`
+    # motion), never from test_dataset: with predict_seq=2..5 that is a shared dance
+    # whose rots are identical for every subject, which would make the selector a
+    # no-op. See collect_identity_poses().
+    identity_poses = collect_identity_poses(scene.train_dataset)
 
     if config.get("start_identity", None) is not None:
         identity_id = int(config.start_identity)

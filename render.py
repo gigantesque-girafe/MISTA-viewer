@@ -42,12 +42,15 @@ def get_camera_folder_name(view):
         return f"camera_{name}"
     return "camera_unknown"
 
-def predict(config) -> None:
+def build_scene(config):
     """
-    Prediction/inference loop for CP, Tucker, TT, and MARS-wrapped TT.
-    Supporte aussi tt5d_color_split (branches géo + couleur séparées).
+    Load a factorized checkpoint (CP / Tucker / TT / MARS-wrapped TT /
+    tt5d_color_split) and build the Scene + GaussianModel from it.
+
+    Shared by predict() and the VR/multiviewer wrapper scripts so that
+    checkpoint-loading behavior can't drift between entry points.
     """
-    with torch.set_grad_enabled(False):
+    with torch.no_grad():
 
         load_ckpt = config.get("load_ckpt", None)
         if load_ckpt is None:
@@ -225,6 +228,16 @@ def predict(config) -> None:
             scene.converter.load_state_dict(tmp["converter_state"])
             print("Converter loaded")
 
+        return scene, migs_type, appearance_id
+
+
+def predict(config) -> None:
+    """
+    Prediction/inference loop for CP, Tucker, TT, and MARS-wrapped TT.
+    Supporte aussi tt5d_color_split (branches géo + couleur séparées).
+    """
+    with torch.set_grad_enabled(False):
+        scene, migs_type, appearance_id = build_scene(config)
 
         # COMMON RENDERING LOOP
         bg_color = [1, 1, 1] if config.dataset.white_background else [0, 0, 0]
@@ -383,118 +396,7 @@ def _log_nonrigid_mlp_activations(scene: Scene, writer_dir: str) -> None:
 
 def test(config) -> None:
     with torch.no_grad():
-        load_ckpt = config.get("load_ckpt", None)
-        if load_ckpt is None:
-            raise ValueError("Please provide load_ckpt when using pruned checkpoint.")
-
-        # Load checkpoint to read shapes and type
-        print("[CHECKPOINT] Loading to extract shapes...")
-        tmp = torch.load(load_ckpt, map_location="cpu")
-        sd = tmp["migs_module_state_dict"]
-        migs_type = tmp.get("migs_type", config.migs.type)
-        print(f"[CHECKPOINT] Detected migs_type = {migs_type}")
-
-        config.migs.type = migs_type  # override config default so Scene builds the right MIGS module
-        config.migs.skip_init_from_tensor = True
-
-        # TT-specific shape extraction
-        is_tt = migs_type not in ("cp", "tucker")
-
-        if is_tt:
-            has_mars_prefix = any(k.startswith("tensorized_model.tt.") for k in sd.keys())
-            prefix = "tensorized_model.tt." if has_mars_prefix else ""
-            if has_mars_prefix:
-                print(f"[CHECKPOINT] Detected MARS-wrapped checkpoint")
-            else:
-                print(f"[CHECKPOINT] Detected pure TT checkpoint")
-
-            try:
-                r1 = sd[f"{prefix}tt_tensor_gpu.0"].shape[-1]
-                r2 = sd[f"{prefix}tt_tensor_gpu.1"].shape[-1]
-                r3 = sd[f"{prefix}tt_tensor_gpu.2"].shape[-1]
-                r4 = sd[f"{prefix}tt_tensor_gpu.3"].shape[-1]
-            except KeyError as e:
-                raise KeyError(f"Missing TT core in checkpoint. Available keys: {list(sd.keys())[:10]}") from e
-
-            config.migs.rank = [1, r1, r2, r3, r4, 1]
-            n_id = sd[f"{prefix}tt_tensor_gpu.0"].shape[1]
-            n1   = sd[f"{prefix}tt_tensor_gpu.1"].shape[1]
-            n2   = sd[f"{prefix}tt_tensor_gpu.2"].shape[1]
-            n3   = sd[f"{prefix}tt_tensor_gpu.3"].shape[1]
-
-            try:
-                M_xyz = sd[f"{prefix}core4_xyz"].shape[1]
-                M_scl = sd[f"{prefix}core4_scaling"].shape[1]
-                M_rot = sd[f"{prefix}core4_rotation"].shape[1]
-                M_dc  = sd[f"{prefix}core4_dc"].shape[1]
-                M_rst = sd[f"{prefix}core4_rest"].shape[1]
-                M_opa = sd[f"{prefix}core4_opacity"].shape[1]
-                M = M_xyz + M_scl + M_rot + M_dc + M_rst + M_opa
-            except KeyError:
-                M_xyz, M_scl, M_rot, M_dc, M_rst, M_opa = 3, 3, 4, 1, 31, 1
-                M = 43
-
-            config.migs.tt_shape = [n_id, n1, n2, n3, M]
-            config.migs.n_identities_ckpt = int(n_id)
-            config.migs.use_mars = False
-
-            print(f"[CHECKPOINT] rank={config.migs.rank}")
-            print(f"[CHECKPOINT] tt_shape={config.migs.tt_shape}")
-
-
-        # Build Scene
-        print("\n[SCENE] Building scene...")
-        gaussians = GaussianModel(config.model.gaussian)
-        scene = Scene(config, gaussians, config.exp_dir)
-        scene.appearance_identity = config.appearance_identity
-        scene.eval()
-
-        # Load weights
-        if is_tt:
-            print(f"\n[TT] Allocating cores from checkpoint shapes...")
-            tt_module = scene.migs_module
-            tt_module.tt_shape = tuple(config.migs.tt_shape)
-            tt_module.tt_rank  = config.migs.rank
-
-            device = "cuda"
-            tt_module.tt_tensor_gpu = nn.ParameterList([
-                nn.Parameter(torch.zeros(1,  n_id, r1, device=device)),
-                nn.Parameter(torch.zeros(r1, n1,   r2, device=device)),
-                nn.Parameter(torch.zeros(r2, n2,   r3, device=device)),
-                nn.Parameter(torch.zeros(r3, n3,   r4, device=device)),
-            ])
-            tt_module.core4_xyz      = nn.Parameter(torch.zeros(r4, M_xyz, 1, device=device))
-            tt_module.core4_scaling  = nn.Parameter(torch.zeros(r4, M_scl, 1, device=device))
-            tt_module.core4_rotation = nn.Parameter(torch.zeros(r4, M_rot, 1, device=device))
-            tt_module.core4_dc       = nn.Parameter(torch.zeros(r4, M_dc,  1, device=device))
-            tt_module.core4_rest     = nn.Parameter(torch.zeros(r4, M_rst, 1, device=device))
-            tt_module.core4_opacity  = nn.Parameter(torch.zeros(r4, M_opa, 1, device=device))
-
-            G = n1 * n2 * n3
-            tt_module.register_buffer("perm",     torch.arange(G, dtype=torch.long, device=device))
-            tt_module.register_buffer("inv_perm", torch.arange(G, dtype=torch.long, device=device))
-            print(f"TT cores allocated (G={G})")
-
-            print(f"\n[CHECKPOINT] Loading TT weights...")
-            if has_mars_prefix:
-                sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-
-            missing, unexpected = tt_module.load_state_dict(sd, strict=False)
-            if missing:
-                print(f"Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
-            if unexpected:
-                print(f"Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
-            print(f"TT weights loaded")
-
-            print(f"\n[CONVERTER] Loading converter state...")
-            scene.converter.load_state_dict(tmp["converter_state"])
-            print(f"Converter loaded")
-
-        else:
-            # CP/Tucker: use normal checkpoint loading
-            print(f"\n[CHECKPOINT] Loading CP/Tucker checkpoint...")
-            scene.load_checkpoint(load_ckpt)
-            print(f"Checkpoint loaded")
+        scene, migs_type, appearance_id = build_scene(config)
 
         # Rendering loop
         print(f"\n[RENDERING] Starting...")

@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - zju_386_mono@datasets.zju_386_mono
+  - zju_387_mono@datasets.zju_387_mono
+  - zju_377_mono@datasets.zju_377_mono
+  - zju_392_mono@datasets.zju_392_mono
+  - zju_315_mono@datasets.zju_315_mono
+  - zju_394_mono@datasets.zju_394_mono
+  - zju_390_mono@datasets.zju_390_mono
+  - zju_393_mono@datasets.zju_393_mono
+  # - zju_313_mono@datasets.zju_313_mono   #  Finetuning person
+
+dataset:
+  name: MultiPersonZJUMoCap
+  names: [
+    'zju_386_mono',
+    'zju_387_mono',
+    'zju_377_mono',
+    'zju_392_mono',
+    'zju_315_mono',
+    'zju_394_mono',
+    'zju_393_mono',
+    'zju_390_mono'
+  ]
+  smpl_uv_npz: "/src/body_models/misc/smpl_uv_coords.npz"
+  
+migs:
+
+  type: cp
+  rank: 100
+  use_mars: false 
+  n_repeat: 10
+  n_iteration: 10
+  verbose: 1
+  add_identity: false
+  gaussian_vis:
+    iterations: [1000, 5000, 10000, 20000, 30000, 40000, 50000]
+
+
+# Optional: pick a single person appearance globally
+appearance_identity: null
