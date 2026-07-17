@@ -22,7 +22,11 @@ import logging
 import torch
 
 from .ipc import GaussianAttrBuffer, GaussianIPCManager
-from .protocol import do_handshake, poll_control, CTRL_SET_IDENTITY, DEFAULT_PORT
+from .protocol import (
+    do_handshake, poll_control,
+    CTRL_SET_IDENTITY, CTRL_SET_PAUSE, CTRL_STEP_FRAME,
+    DEFAULT_PORT,
+)
 
 log = logging.getLogger("vr_viewer.server")
 
@@ -77,11 +81,12 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
     #                     nothing when produce > 33 ms; this forces a real sleep so
     #                     the GPU is freed for the render process. This is the fix
     #                     for deform<->render GPU contention.
-    #   VR_FREEZE_AFTER : after this many frames, stop deforming and just
-    #                     re-announce the last buffer. The TCP connection stays up
-    #                     and C++ keeps rendering, but Python does ZERO GPU work.
-    #                     If C++'s mlp/raster times then drop, the slowdown was GPU
-    #                     contention with the deformer (not thermal).
+    #   VR_FREEZE_AFTER : start paused after this many frames. Equivalent to the
+    #                     viewer's Pause button, but without needing a viewer: the
+    #                     TCP connection stays up and C++ keeps rendering, but
+    #                     Python does ZERO GPU work. If C++'s mlp/raster times then
+    #                     drop, the slowdown was GPU contention with the deformer
+    #                     (not thermal).
     produce_hz = float(os.environ.get("VR_PRODUCE_HZ", "0"))
     if produce_hz > 0:
         target_frame_seconds = 1.0 / produce_hz
@@ -89,7 +94,7 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                  produce_hz, target_frame_seconds * 1000.0)
     freeze_after = int(os.environ.get("VR_FREEZE_AFTER", "0"))
     if freeze_after:
-        log.info("[FREEZE] will stop deforming after %d frames (connection stays up).",
+        log.info("[PAUSE] will auto-pause after %d frames (connection stays up).",
                  freeze_after)
 
     log.info("Allocating double-buffered IPC buffers: N_max=%d  K=%d", source.N_max, source.K)
@@ -116,7 +121,13 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                 pipeline_frame_id = 0
                 buf_idx = 0
                 anim_frame = 0
-                frozen = False
+                # Animation pause state. A fresh viewer connection always starts
+                # running; VR_FREEZE_AFTER re-arms below on its own frame count.
+                paused = False
+                announced_pause = False
+                step_delta = 0
+                last_frame = 0
+                freeze_armed = bool(freeze_after)   # VR_FREEZE_AFTER fires once, then disarms
                 last_buf, last_N = 0, source.N_max
 
                 while True:
@@ -129,21 +140,55 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                         if magic == CTRL_SET_IDENTITY:
                             log.info("[CTRL] set identity -> %d", payload)
                             source.pending_id = payload
+                        elif magic == CTRL_SET_PAUSE:
+                            paused = bool(payload)
+                            log.info("[CTRL] %s at frame %d",
+                                     "pause" if paused else "resume", last_frame)
+                            if not paused:
+                                announced_pause = False
+                                step_delta = 0
+                        elif magic == CTRL_STEP_FRAME:
+                            # Only meaningful while paused; ignore otherwise rather
+                            # than nudging a running animation.
+                            if paused:
+                                step_delta += payload
+                                log.info("[CTRL] step %+d (pending %+d)", payload, step_delta)
+                            else:
+                                log.info("[CTRL] step %+d ignored — not paused", payload)
                         else:
                             log.warning("[CTRL] unknown control magic %r", magic)
 
-                    # ── FREEZE diagnostic: keep the socket + C++ rendering alive,
-                    # but do ZERO GPU work — just re-announce the last good buffer.
-                    if freeze_after and anim_frame >= freeze_after:
-                        if not frozen:
-                            log.info("[FREEZE] producer stopped at frame %d — re-announcing "
+                    # Auto-pause diagnostic: sets the same state the Pause button does.
+                    # Disarms after firing so the viewer's Resume button still works
+                    # (it would otherwise re-pause on the very next iteration).
+                    if freeze_armed and anim_frame >= freeze_after:
+                        log.info("[PAUSE] auto-pausing at frame %d (VR_FREEZE_AFTER=%d).",
+                                 anim_frame, freeze_after)
+                        paused = True
+                        freeze_armed = False
+
+                    # ── Paused: keep the socket + C++ rendering alive, but do ZERO
+                    # GPU work — just re-announce the last good buffer. A pending
+                    # step falls through to produce exactly one new frame.
+                    if paused and step_delta == 0:
+                        if not announced_pause:
+                            log.info("[PAUSE] producer stopped on frame %d — re-announcing "
                                      "buf %d (N=%d). Python GPU now idle; watch C++ mlp/raster.",
-                                     anim_frame, last_buf, last_N)
-                            frozen = True
+                                     last_frame, last_buf, last_N)
+                            announced_pause = True
                         conn.sendall(struct.pack("<QII", pipeline_frame_id, last_buf, last_N))
                         pipeline_frame_id += 1
                         time.sleep(target_frame_seconds)
                         continue
+
+                    if paused:
+                        # Step relative to the pose actually on screen (last_frame),
+                        # not anim_frame — that already points at the NEXT frame.
+                        anim_frame = (last_frame + step_delta) % source.n_frames
+                        log.info("[PAUSE] step %+d: frame %d -> %d",
+                                 step_delta, last_frame, anim_frame)
+                        step_delta = 0
+                        announced_pause = False   # re-log once the stepped frame is held
 
                     # Don't overwrite this buffer until C++ is done reading it.
                     tw = time.perf_counter()
@@ -166,7 +211,8 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                     ipc_mgrs[buf_idx].record_data_ready()
                     conn.sendall(struct.pack("<QII", pipeline_frame_id, buf_idx, N))
                     signal_ms = (time.perf_counter() - t4) * 1000.0
-                    last_buf, last_N = buf_idx, N   # newest valid buffer (for FREEZE)
+                    last_buf, last_N = buf_idx, N   # newest valid buffer (re-announced while paused)
+                    last_frame = anim_frame % source.n_frames   # pose now on screen; steps are relative to it
 
                     total_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -174,6 +220,10 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                     if remaining > 0:
                         time.sleep(remaining)
 
+                    # anim_frame always means "the frame to produce next" — a paused
+                    # loop never reaches here (it re-announces and continues), so
+                    # this only runs when free-running or after a step, and in both
+                    # cases the next frame is the following one.
                     anim_frame += 1
                     pipeline_frame_id += 1
                     buf_idx = 1 - buf_idx

@@ -75,10 +75,17 @@ class MultiPersonZJUMoCapDataset(Dataset):
         sample_idx = index - self.cumulative_sizes[dataset_idx]
         sample = self.datasets[dataset_idx][sample_idx]
 
+        # person_id indexes the TT identity core, so it must be the identity's
+        # position in cfg.dataset.names (the pid captured at load time), NOT the
+        # position in self.datasets. Those diverge whenever a subject is skipped
+        # above: with predict_seq=2, 315 and 390 have no AIST folder, so 394 lands
+        # at datasets[4] and would be stamped person_id=4 — which is 315's core.
+        person_id = self.all_person_ids[index]
+
         if hasattr(sample, 'data'):
-            sample.data['person_id'] = dataset_idx
-            setattr(sample, 'person_id', dataset_idx)
+            sample.data['person_id'] = person_id
+            setattr(sample, 'person_id', person_id)
         else:
-            sample['person_id'] = dataset_idx
+            sample['person_id'] = person_id
 
         return sample

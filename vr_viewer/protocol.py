@@ -24,6 +24,8 @@ DEFAULT_PORT = 6012
 # reads. The C++ viewer's GUI can send a small control message the other way on
 # the same (full-duplex) socket. Each message is 8 bytes: magic + int32 payload.
 CTRL_SET_IDENTITY = b"CTL0"   # payload = int32 identity index
+CTRL_SET_PAUSE    = b"CTL1"   # payload = int32, 1 = pause, 0 = resume
+CTRL_STEP_FRAME   = b"CTL2"   # payload = int32 frame delta (+1/-1); only while paused
 _CTRL_LEN = 8
 
 
