@@ -63,7 +63,7 @@ _AXIS_FIX = [[-0.9601507782936096,  0.15131592750549316, -0.2349766492843628],
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature extraction — mirrors MISTA ColorMLP.compose_input (view-independent part).
 # These read MISTA's Gaussian data model directly, so they stay in the adapter
-# (not in the pipeline-agnostic vr_viewer package).
+# (not in the vr_viewer package).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_view_indep_features(color_mlp, gaussians, camera) -> torch.Tensor:
@@ -85,15 +85,29 @@ def extract_view_indep_features(color_mlp, gaussians, camera) -> torch.Tensor:
     return features   # [N, K]
 
 
-def extract_R_bwd(gaussians, cano_view_dir: bool) -> torch.Tensor:
-    if cano_view_dir and hasattr(gaussians, 'fwd_transform'):
-        T_fwd = gaussians.fwd_transform
-        R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
-        return R_bwd.reshape(-1, 9).contiguous()
+def extract_R_bwd(gaussians, cano_view_dir: bool, axis_fix: torch.Tensor) -> torch.Tensor:
+    """Per-Gaussian rotation applied to the SH view direction on the client.
+
+    The client builds `dir_pp = xyz - cam_center` from the xyz we send, which are
+    in the VR frame (p_vr = A p_world, `axis_fix` = A). But the texture was
+    trained with dir_pp in WORLD space — see models/texture/texture.py:107, which
+    uses gaussians.get_xyz and camera.camera_center directly, with no axis fix.
+
+    So we must undo A before the canonical rotation:
+        dir_cano = R_bwd (p - q)  =  R_bwd Aᵀ · A(p - q)  =  (R_bwd Aᵀ) dir_vr
+    i.e. the matrix we ship is R_bwd @ Aᵀ, not R_bwd. Without the Aᵀ the SH basis
+    is evaluated at a direction rotated by a large non-axis-aligned A, which
+    shifts hue on view-dependent surfaces (skin reads blue/cyan).
+    """
     N   = gaussians.get_xyz.shape[0]
     dev = gaussians.get_xyz.device
-    return torch.eye(3, dtype=torch.float32, device=dev)\
-               .unsqueeze(0).expand(N, -1, -1).reshape(N, 9).contiguous()
+    if cano_view_dir and hasattr(gaussians, 'fwd_transform'):
+        T_fwd = gaussians.fwd_transform
+        R_bwd = T_fwd[:, :3, :3].transpose(1, 2)          # world -> canonical
+    else:
+        R_bwd = torch.eye(3, dtype=torch.float32, device=dev).unsqueeze(0).expand(N, -1, -1)
+    R_bwd = torch.matmul(R_bwd, axis_fix.t())             # VR -> world -> canonical
+    return R_bwd.reshape(N, 9).contiguous()
 
 
 def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
@@ -180,7 +194,7 @@ class MistaVRSource(VRSource):
 
             # ── View-independent feature extraction ──────────────────────────
             feat    = extract_view_indep_features(self.color_mlp, deformed_pc, cam_c)
-            R_bwd_f = extract_R_bwd(deformed_pc, self.cano)
+            R_bwd_f = extract_R_bwd(deformed_pc, self.cano, self.axis_fix)
 
             # ── Placement (axis fix + origin pin) ────────────────────────────
             xyz = deformed_pc.get_xyz @ self.axis_fix.T

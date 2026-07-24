@@ -244,7 +244,7 @@ def build_scaling_rotation(s, r):
 
 def fix_random(seed):
     if seed >= 0:
-        print(f"🔐 Fixing seed: {seed}")
+        print(f"[SEED] Fixing seed: {seed}")
         os.environ["PYTHONHASHSEED"] = str(seed)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # for reproducibility on CUDA
         random.seed(seed)

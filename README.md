@@ -250,19 +250,49 @@ We sincerely thank the authors of these works for making their research and reso
 
 ---
 ## Run VR Application
+### Setup the headset
+- Open Meta Horizon Link software, then goes into Settings > General > Set Meta Link as default OpenXR. You may need administrator right for this
+- 
+
+
+## Setup the PC
+
 
 Predict new pose mode
 ```shell
+call "C:\Users\travu\AppData\Local\miniconda3\Scripts\activate.bat" "C:\Users\travu\AppData\Local\miniconda3"
+
+conda activate 3dgs-avatar
+
 set KMP_DUPLICATE_LIB_OK=TRUE
 
-python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+# Original render file
+python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="C:/Users/travu/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
 
+# fixed identity
+python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth"
+
+# realtime multi-identity change - MISTA
+python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=0 +start_identity=0 load_ckpt=H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth
+
+# realtime multi-identity change - MIGS
+python render_v1_modular_multiviewer.py mode=predict dataset=migs migs.type=cp migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt=C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth
+
+# test motion transfer
+
+python render.py mode=predict dataset=migs_multi_zju_5d_mars dataset.predict_seq=2 migs.use_mars=false opt.iterations=50000 appearance_identity=5 load_ckpt="C:/Users/travu/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
 
 ```
 
 Test view
 ```shell
 python render_vr_v1.py mode=test dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
+
+
+
+# Run migs
+python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" wandb_disable=True
+
 ```
 
 Note:
@@ -274,9 +304,59 @@ In second terminal: OpenXR Application for VR Viewer
 $env:V42_TIMING=1
 $env:V42_INTEROP=1
 
-submodules\sibr_core\install\bin\SIBR_remoteGaussianOpenXRv4_2_app_rwdi.exe --ip 127.0.0.1 --port 6012
+# Run VR App
+submodules\sibr-core\install\bin\SIBR_remoteGaussianOpenXRv4_2_app_rwdi.exe --ip 127.0.0.1 --port 6012
 
-
+# Run ViewerUI on computer screen
+submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe --ip 127.0.0.1 --port 6012
 ```
 
+Desktop viewer camera (mouse trackball, hover the rendered image — not the window chrome):
+
+| input | action |
+| --- | --- |
+| Left-drag | orbit the avatar (roll if you start in the outer border) |
+| Right-drag | pan (dolly if you start in the outer border) |
+| Scroll | zoom in / out — no keyboard key may be held |
+| `Y` | toggle FPS/WASD mode (the old keyboard navigation) and back |
+| `P` / `Left` / `Right` | pause-resume the animation / step +/-1 frame (camera stays live) |
+
+The `Camera ...` ImGui panel has the same mode dropdown plus FoV, near/far and camera save/load.
+
 * Surveille le GPU
+```
+nvidia-smi dmon
+```
+
+### Running double viewer
+Both tiles share one camera: drag inside either one and both viewpoints move together
+(same controls as the single-tile table above).
+```shell
+# Low resolution
+& "C:\Users\travu\MISTA\submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
+
+# high resolution
+& "C:\Users\travu\MISTA\submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
+
+#Terminal 1 — TT5D
+python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" +gaussians_vr.port=6012
+
+#Terminal 2 — CP-R100
+python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" wandb_disable=True +gaussians_vr.port=6013
+```
+
+### Running full pipeline in Python
+```shell
+# terminal 1 (migs)
+python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" +desktopv1.port=6009 +desktopv1.hold=0
+# terminal 1 (mista)
+python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs_multi_zju_5d_mars migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" +desktopv1.port=6009 +desktopv1.hold=0
+
+# Terminal 2
+submodules\sibr-core\install\bin\SIBR_remoteGaussian_app_rwdi.exe --ip 127.0.0.1 --port 6009 -s data\dummy_viewer
+```
+
+
+
+
+
