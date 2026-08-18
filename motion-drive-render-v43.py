@@ -284,7 +284,8 @@ class RompMistaVRSource(MistaVRSource):
             cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
 
         self._t_prev_frame = None
-        self._fps_ema = None
+        self._dt_ema = None
+        self._romp_ctr = 0                 # drives --romp-every-n skipping
 
     # -- pose extraction + One-Euro filtering + missing handling -------------- #
     def _get_filtered_pose(self, frame, t_now):
@@ -358,15 +359,18 @@ class RompMistaVRSource(MistaVRSource):
         now = time.perf_counter()
         if self._t_prev_frame is not None:
             dt = now - self._t_prev_frame
-            inst = 1.0 / dt if dt > 0 else 0.0
-            self._fps_ema = inst if self._fps_ema is None else 0.9 * self._fps_ema + 0.1 * inst
+            # Smooth the frame TIME (not 1/dt): averaging instantaneous rates is
+            # dominated by cheap skip frames and wildly overstates throughput.
+            # FPS = 1 / mean(dt) is the true frames-per-second.
+            self._dt_ema = dt if self._dt_ema is None else 0.9 * self._dt_ema + 0.1 * dt
         self._t_prev_frame = now
 
         disp = frame.copy()
-        fps = self._fps_ema if self._fps_ema is not None else 0.0
+        fps = (1.0 / self._dt_ema) if self._dt_ema else 0.0
         line1 = f"FPS: {fps:5.1f}   produce: {produce_ms:6.1f} ms   id: {self.identity}   pose: {status}"
         sp = f" [{self.args.filter_space}]" if self.args.smooth else ""
-        line2 = (f"smooth {'ON' if self.args.smooth else 'OFF'}{sp}  "
+        nev = f"  romp 1/{self.args.romp_every_n}" if self.args.romp_every_n > 1 else ""
+        line2 = (f"smooth {'ON' if self.args.smooth else 'OFF'}{sp}{nev}  "
                  f"miss={self.missing_count}  -> C++/SIBR viewer")
         cv2.putText(disp, line1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 255, 0), 2, cv2.LINE_AA)
@@ -396,27 +400,36 @@ class RompMistaVRSource(MistaVRSource):
             # End of video (or camera failure): stop the server cleanly.
             raise KeyboardInterrupt("end of stream")
 
-        # ── 2) ROMP -> One-Euro -> pose (missing handled) ─────────────────────
-        pose, status = self._get_filtered_pose(frame, t0)
+        # ── 2) Run ROMP only every Nth frame (--romp-every-n); reuse the last
+        #      avatar on the others. ROMP (~95 ms) dominates the frame, so on skip
+        #      frames we do NO ROMP and NO deform: the C++ viewer keeps rendering
+        #      the last posed buffer while the source window still advances every
+        #      frame. N=1 (default) = ROMP every frame (unchanged behavior). ─────
+        run_romp = (self._romp_ctr % self.args.romp_every_n == 0) or (self.last_tensors is None)
+        self._romp_ctr += 1
 
-        # ── 3-5) Build live camera, deform, pack. On no-pose (beyond reuse),
-        #         re-send the last produced attributes so the avatar just holds. ─
-        if pose is not None:
-            rots, bone_transforms = pose_to_camera_fields(
-                pose, self.Jtr_target, self.b02v_inv, self.device
-            )
-            cam = self.template_cam.copy()
-            cam.update(rots=rots, bone_transforms=bone_transforms)
-            cam.person_id = self.identity
-            tensors = self._deform_and_pack(cam)
-            self.last_tensors = tensors
-        elif self.last_tensors is not None:
-            tensors = self.last_tensors      # freeze avatar on lost target
+        if run_romp:
+            # ── ROMP -> One-Euro -> pose (missing handled) -> deform + pack ─────
+            pose, status = self._get_filtered_pose(frame, t0)
+            if pose is not None:
+                rots, bone_transforms = pose_to_camera_fields(
+                    pose, self.Jtr_target, self.b02v_inv, self.device
+                )
+                cam = self.template_cam.copy()
+                cam.update(rots=rots, bone_transforms=bone_transforms)
+                cam.person_id = self.identity
+                tensors = self._deform_and_pack(cam)
+                self.last_tensors = tensors
+            elif self.last_tensors is not None:
+                tensors = self.last_tensors      # freeze avatar on lost target
+            else:
+                # No pose yet and nothing cached: send the canonical avatar once.
+                tensors = self._deform_and_pack(self.template_cam)
+                self.last_tensors = tensors
         else:
-            # No pose yet and nothing cached: send the canonical (undeformed) avatar
-            # once so the buffer is valid. Uses the template camera as-is.
-            tensors = self._deform_and_pack(self.template_cam)
-            self.last_tensors = tensors
+            # ── Skip frame: reuse the last posed avatar (no ROMP, no deform) ────
+            tensors = self.last_tensors
+            status = f"SKIP {self._romp_ctr % self.args.romp_every_n}/{self.args.romp_every_n}"
 
         produce_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -443,6 +456,21 @@ def parse_args():
                    help="TCP port the C++/SIBR viewer connects to (default 6012).")
     p.add_argument("--no-window", action="store_true",
                    help="Disable the Python source-frame window (stream to C++ only).")
+    p.add_argument("--romp-every-n", type=int, default=1,
+                   help="Run ROMP (and re-deform) every N frames, reusing the last "
+                        "pose on the others. 1 = every frame (default). N=2 ~doubles "
+                        "FPS at the cost of coarser pose sampling.")
+
+    # ROMP inference backend. ONNX+onnxruntime-gpu is ROMP's real-time path (~3x
+    # faster than the plain PyTorch backbone) and is the default here; pass
+    # --no-onnx to force the PyTorch path. Falls back to PyTorch automatically if
+    # onnxruntime's CUDA provider isn't available (so we never silently run on CPU,
+    # which would be slower than PyTorch).
+    p.add_argument("--onnx", dest="onnx", action="store_true",
+                   help="Use ROMP's ONNX GPU backend (default; big speedup).")
+    p.add_argument("--no-onnx", dest="onnx", action="store_false",
+                   help="Force ROMP's plain PyTorch backbone instead of ONNX.")
+    p.set_defaults(onnx=True)
 
     # One-Euro temporal smoothing (enabled by default; same flags as Phase 1).
     p.add_argument("--smooth", dest="smooth", action="store_true",
@@ -470,6 +498,8 @@ def main():
         raise SystemExit("--source video requires --video PATH")
     if not (0 <= args.identity <= 7):
         raise SystemExit("--identity must be in 0..7")
+    if args.romp_every_n < 1:
+        raise SystemExit("--romp-every-n must be >= 1")
 
     device = "cuda"
 
@@ -499,8 +529,31 @@ def main():
     print(f"[INIT] Feature dim K={K}; ColorMLP TorchScript={len(model_bytes)} bytes.")
 
     # ---- ROMP ----
-    print("[INIT] Initializing ROMP ...")
-    romp_model = romp.ROMP(romp.romp_settings(input_args=[]))
+    # We only consume out["smpl_thetas"], so:
+    #   --show_largest : single-person post-processing only (we drive one user)
+    #   --calc_smpl    : this flag DISABLES the SMPL mesh forward (it's a
+    #                    store_false in romp), which we don't use -> saves time
+    # ONNX GPU is the real-time backend; only use it if onnxruntime actually has a
+    # working CUDA provider, else fall back to the PyTorch path (never CPU-ONNX,
+    # which is slower than PyTorch).
+    use_onnx = args.onnx
+    if use_onnx:
+        try:
+            import onnxruntime as _ort
+            if "CUDAExecutionProvider" not in _ort.get_available_providers():
+                print("[INIT] onnxruntime has no CUDAExecutionProvider; "
+                      "falling back to ROMP PyTorch backend.")
+                use_onnx = False
+        except ImportError:
+            print("[INIT] onnxruntime not installed; "
+                  "falling back to ROMP PyTorch backend.")
+            use_onnx = False
+
+    romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
+    if use_onnx:
+        romp_argv.append("--onnx")
+    print(f"[INIT] Initializing ROMP ({'ONNX-GPU' if use_onnx else 'PyTorch'}) ...")
+    romp_model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
     print("[INIT] ROMP ready.")
 
     # ---- Input source ----

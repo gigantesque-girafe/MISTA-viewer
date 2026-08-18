@@ -17,6 +17,7 @@ from scene.gaussian_model import GaussianModel
 from dataset import load_dataset
 from models.cp_migs_module import CPMIGSModule
 from models.mista import MISTA
+from models.mista_color_split import MISTAColorSplit
 from utils.snapshot_hooks import maybe_dump_gaussians
 from utils.general_utils import make_subseed, torch_rng_context
 from models.importance_analysis.frobenius import compute_frobenius_LR
@@ -29,7 +30,8 @@ from models.importance_analysis.reporter import generate_reports
 MIGS_CLASS_MAP = {
     "cp": CPMIGSModule,
     "tt5d": MISTA,
-    "tt": MISTA,  # some checkpoints label the 5D TT module simply "tt"
+    "tt5d_color_split": MISTAColorSplit,
+    
 }
 TT_MIGS_TYPES = (
     "tt4d", "tt5d", "tt6d", "tt5d_perblock",
@@ -970,6 +972,7 @@ class Scene:
             # Step 1: Create BASE TT module
             class_map = {
                 "tt5d": MISTA,
+                "tt5d_color_split": MISTAColorSplit, 
             }
             base_tt = class_map[self.migs_type](self.cfg)
             if not getattr(self.cfg.migs, 'skip_init_from_tensor', False):

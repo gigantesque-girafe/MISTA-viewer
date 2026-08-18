@@ -37,23 +37,25 @@ migs:
   identity_bias: 0.90     # < 1.25 to calm r1
   mid_boost: 1.15         # give more to 50–40–25
   weight_power: 1.15      # favor larger modes a bit
-  # Optional manual hint for the rank right before M. 
-  # Set to null for automatic selection.
   rM_hint: null
 
   # Hard cap for the rank right before M (must be <= M). 
   # For M=43, keep 43.
-  #cap_last: 43
-  cap_geo: 11
-  rM_colo: 32
   cap_last: 43
-  save_foldpack_vis: true
-  delay: 1000
-  rank: null
-  tt_shape: null
-  verbose: true
-  add_identity: false
+  # Rangs manuels séparés geo / color
+  geo_rid: 48
+  geo_rn1: 56
+  geo_rn2: 36
+  geo_rM: 11
 
+  color_rn1: 50
+  color_rn2: 32
+  color_rM: 24
+  # cap_geo: 11
+  # rM_colo: 32
+  # cap_last: 43
+  # rank_geo: [1, 24, 32, 16, 1]
+  # rank_app: [1, 96, 128, 64, 1]
   use_mars: false
   position_lr_init: 1.6e-4
   position_lr_final: 1.6e-6
@@ -63,7 +65,6 @@ migs:
   # tt_final_lrs: [1e-5 ,1e-5, 1e-5,1e-5]
   gaussian_vis:
     iterations: [1000, 5000, 10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000]
-
 
   mars:
       pi: 0.1
