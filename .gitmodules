@@ -11,3 +11,9 @@
 [submodule "submodules/sibr-flat"]
 	path = submodules/sibr-flat
 	url = https://gitlab.inria.fr/sibr/sibr_core.git
+[submodule "submodules/submodules/PARE"]
+	path = submodules/submodules/PARE
+	url = https://github.com/mkocabas/PARE.git
+[submodule "submodules/PARE"]
+	path = submodules/PARE
+	url = https://github.com/mkocabas/PARE.git

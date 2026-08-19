@@ -275,6 +275,8 @@ python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.
 # realtime multi-identity change - MISTA
 python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=0 +start_identity=0 load_ckpt=H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth
 
+python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d_color_split migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt="C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth"
+
 # realtime multi-identity change - MIGS
 python render_v1_modular_multiviewer.py mode=predict dataset=migs migs.type=cp migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt=C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth
 
@@ -357,6 +359,20 @@ submodules\sibr-core\install\bin\SIBR_remoteGaussian_app_rwdi.exe --ip 127.0.0.1
 ```
 
 
+### ROMP wiring with OpenCV visualization
+python motion-driven-render.py --source video --video C:/Users/travu/Downloads/taichi.mp4 --identity 3 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --output out.mp4
+
+```shell
+#with filter: avatar upside down
+python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 2 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --port 6012
+
+# no filter
+python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 2 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --port 6012 --no-smooth
+
+# same desktop viewer
 
 
+# with color split model
+python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --port 6012 --romp-every-n 2
+```
 

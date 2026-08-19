@@ -60,383 +60,121 @@ import argparse
 import cv2
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
-# Make sure the MISTA package root (this file's directory) is importable.
+# Make sure the MISTA package root (this file's directory) is importable, so that
+# both the repo-root modules and the `pipeline` package resolve when running this
+# script directly.
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from omegaconf import OmegaConf
-from hydra import compose, initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
-
 # MISTA / viewer building blocks (reused as-is).
 from render import build_scene                              # checkpoint + scene loader
-from dataset.zjumocap import ZJUMoCapDataset               # for _recompute_bone_transforms
-from vr_viewer import run_server                            # generic streaming loop (UNCHANGED)
+from vr_viewer import run_server, VRSource                  # streaming loop + pipeline contract (UNCHANGED)
 from vr_viewer.colormlp_export import (
     export_color_mlp,
     _view_indep_feat_dim as view_indep_feat_dim,
 )
-# The MISTA VR adapter: we subclass its source and reuse its feature helpers verbatim.
-from render_vr_v1_modular import (
-    MistaVRSource,
-    extract_view_indep_features,
-    extract_R_bwd,
-    cov3D_in_vr_frame,
+
+# Pipeline stages (single-responsibility collaborators; see pipeline/), listed in
+# the order data flows through them. One-time setup first, then the per-frame chain
+# that LiveVRSource sequences: frame -> pose -> smooth -> camera -> deform -> preview.
+from pipeline import (
+    load_mista_config,  # [setup]  composes the MISTA Hydra config (test split, chosen identity, no PLY export)
+    build_estimator,    # [setup]  factory -> a PoseEstimator backend (ROMP or PARE): frame -> raw (72,) pose or None
+    FrameSource,        # [1] grabs the next BGR frame from the webcam/video; signals end-of-stream
+    #     (the estimator built above runs here: frame -> raw (72,) SMPL pose or None)
+    PoseProcessor,      # [2] One-Euro smoothing of the raw pose + missing-detection (reuse/reset) policy
+    MistaPoseAdapter,   # [3] turns a (72,) SMPL pose into the MISTA deformer camera (rots + bone transforms)
+    MistaRenderer,      # [4] deforms the canonical Gaussians by that camera -> 5 attribute tensors for C++ IPC
+    SourceWindow,       # [5] Python OpenCV preview of the driving frame + status overlay ('q'/Esc quits)
 )
 
-# ROMP pose estimator (installed package).
-import romp
-
-
-# Sentinel deform/texture iteration: past every training/delay/export threshold so no
-# iteration-keyed disk writes fire (the VR deform path already avoids render()'s export
-# gate, but we stay consistent with Phase 1).
-RENDER_ITER = 10 ** 9
-
 
 # --------------------------------------------------------------------------- #
-# One-Euro temporal filter  (duplicated verbatim from motion-driven-render.py;
-# v43 is intentionally self-contained so the Phase-1 file stays untouched)
+# Orchestrator: LiveVRSource wires the pipeline stages (pipeline/) into the
+# vr_viewer server contract. All domain logic lives in the pipeline collaborators;
+# this class only sequences them per produce_frame() call.
 # --------------------------------------------------------------------------- #
-class OneEuroFilter:
-    """
-    Causal One-Euro low-pass filter, vectorized over a NumPy array. Filters each
-    element using only current+previous samples (no future frames). State persists
-    across calls. Runs on the CPU on the tiny (<=72,) float32 pose — no GPU transfer.
-    """
+class LiveVRSource(VRSource):
+    """Thin orchestrator wiring the pipeline stages into the server contract.
 
-    def __init__(self, min_cutoff=0.8, beta=0.05, d_cutoff=1.0, freq=12.5):
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.d_cutoff = float(d_cutoff)
-        self.freq = float(freq)
-        self.reset()
-
-    def reset(self):
-        self.x_prev = None
-        self.dx_prev = None
-        self.t_prev = None
-
-    @property
-    def initialized(self) -> bool:
-        return self.x_prev is not None
-
-    @staticmethod
-    def _alpha(cutoff, dt):
-        tau = 1.0 / (2.0 * np.pi * cutoff)
-        return 1.0 / (1.0 + tau / dt)
-
-    def __call__(self, x, t=None):
-        x = np.asarray(x, dtype=np.float32)
-        if self.x_prev is None:
-            self.x_prev = x.copy()
-            self.dx_prev = np.zeros_like(x)
-            self.t_prev = t
-            return x.copy()
-        if t is not None and self.t_prev is not None:
-            dt = t - self.t_prev
-            if (not np.isfinite(dt)) or dt <= 1e-4 or dt > 1.0:
-                dt = 1.0 / self.freq
-        else:
-            dt = 1.0 / self.freq
-        self.t_prev = t
-        dx = (x - self.x_prev) / dt
-        a_d = self._alpha(self.d_cutoff, dt)
-        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
-        a = self._alpha(cutoff, dt)
-        x_hat = a * x + (1.0 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        return x_hat.astype(np.float32)
-
-
-class RotationOneEuroFilter:
-    """
-    Rotation-aware One-Euro filter (duplicated verbatim from motion-driven-render.py).
-    Filters rotations in QUATERNION space with sign (hemisphere) continuity, then
-    converts back to axis-angle, avoiding the axis-angle double-cover/wrap
-    discontinuities that briefly flip the avatar. Input/output are axis-angle
-    vectors (J*3,); drop-in replacement for OneEuroFilter.
+    Owns no domain logic beyond per-frame sequencing and the --romp-every-n skip
+    policy: each produce_frame() reads a frame, (every Nth) estimates + processes
+    + adapts + renders a pose, freezes the last avatar on miss/skip, previews the
+    frame, and hands the 5-tuple back to run_server for IPC to C++.
     """
 
-    def __init__(self, min_cutoff=0.8, beta=0.05, d_cutoff=1.0, freq=12.5):
-        self._oe = OneEuroFilter(min_cutoff, beta, d_cutoff, freq)
-
-    def reset(self):
-        self._oe.reset()
-
-    @property
-    def initialized(self) -> bool:
-        return self._oe.initialized
-
-    def __call__(self, x, t=None):
-        aa = np.asarray(x, dtype=np.float32).reshape(-1)
-        J = aa.shape[0] // 3
-        q = Rotation.from_rotvec(aa.reshape(J, 3)).as_quat().astype(np.float32)  # (J,4) xyzw
-        if self._oe.x_prev is not None:
-            q_ref = np.asarray(self._oe.x_prev, dtype=np.float32).reshape(J, 4)
-            flip = np.sum(q * q_ref, axis=1) < 0.0
-            q[flip] *= -1.0
-        qf = self._oe(q.reshape(-1), t).reshape(J, 4)
-        n = np.linalg.norm(qf, axis=1, keepdims=True)
-        n[n < 1e-8] = 1.0
-        qf = qf / n
-        return Rotation.from_quat(qf).as_rotvec().astype(np.float32).reshape(-1)
-
-
-# --------------------------------------------------------------------------- #
-# Pose -> Camera fields  (duplicated verbatim from motion-driven-render.py)
-# --------------------------------------------------------------------------- #
-def pose_to_camera_fields(smpl_thetas_72, Jtr_target, b02v_inv, device):
-    """
-    Convert a single ROMP SMPL pose (72-d axis-angle) into the tensors MISTA's
-    deformer consumes: `rots` (1,24,9) and `bone_transforms` (24,4,4). Mirrors
-    dataset/zjumocap.py getitem() exactly. Fixed camera => trans = 0.
-    """
-    thetas = np.asarray(smpl_thetas_72, dtype=np.float32).reshape(-1)
-    root_orient = thetas[0:3]
-    pose_body = thetas[3:66]     # 63 = 21 joints
-    pose_hand = thetas[66:72]    # 6  = 2 joints (zero-padded by ROMP)
-
-    pose_full = np.concatenate([root_orient, pose_body, pose_hand], axis=-1)
-    pose_mat_full = Rotation.from_rotvec(pose_full.reshape([-1, 3])).as_matrix()  # (24,3,3)
-    pose_mat = pose_mat_full[1:, ...].copy()                                      # (23,3,3)
-    pose_rot = np.concatenate(
-        [np.expand_dims(np.eye(3), axis=0), pose_mat], axis=0
-    ).reshape([-1, 9])                                                            # (24,9)
-    rots = torch.from_numpy(pose_rot).float().unsqueeze(0).to(device)            # (1,24,9)
-
-    bt = ZJUMoCapDataset._recompute_bone_transforms(
-        root_orient, pose_body, pose_hand, Jtr_target
-    )                                                                            # (24,4,4)
-    bt = (bt @ b02v_inv).astype(np.float32)
-    bone_transforms = torch.from_numpy(bt).to(device)                            # (24,4,4)
-
-    return rots, bone_transforms
-
-
-# --------------------------------------------------------------------------- #
-# Config (same compose pattern as motion-driven-render.py)
-# --------------------------------------------------------------------------- #
-def load_mista_config(load_ckpt: str, identity: int):
-    configs_dir = os.path.join(_ROOT, "configs")
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    with initialize_config_dir(version_base=None, config_dir=configs_dir):
-        config = compose(config_name="config_5d")
-
-    OmegaConf.set_struct(config, False)
-    config.mode = "test"                 # test split -> real ZJU frames + per-identity Jtr
-    config.appearance_identity = int(identity)
-    config.load_ckpt = load_ckpt
-    config.dataset.preload = False
-    config.wandb_disable = True
-    if config.get("export", None) is not None:
-        config.export.enable = False     # never write PLY snapshots
-    return config
-
-
-# --------------------------------------------------------------------------- #
-# ROMP-driven VR source: reuse MistaVRSource deform/feature path, live-source poses
-# --------------------------------------------------------------------------- #
-class RompMistaVRSource(MistaVRSource):
-    """
-    Subclass of the MISTA VR adapter that replaces the static predict-sequence
-    `smpl_cams` with a LIVE webcam/video -> ROMP -> One-Euro -> pose_to_camera_fields
-    step, and shows the source frame in a Python OpenCV window. Everything downstream
-    (deformation, feature extraction, IPC transport, C++ ColorMLP/rasterization) is the
-    existing path, untouched.
-    """
-
-    def __init__(self, scene, template_cam, Jtr_target, b02v_inv,
-                 K, model_bytes, N_max, cap, romp_model, args):
-        # Reuse all of MistaVRSource's setup; n_frames=1 placeholder (frame_idx is
-        # ignored for sourcing — we grab the next live frame each call).
-        super().__init__(scene, [template_cam], RENDER_ITER, K, model_bytes, N_max)
-
-        self.template_cam = template_cam
-        self.Jtr_target = Jtr_target
-        self.b02v_inv = b02v_inv
-        self.cap = cap
-        self.romp = romp_model
+    def __init__(self, frame_source, estimator, processor, adapter, renderer, args):
+        self.frame_source = frame_source
+        self.estimator = estimator          # PoseEstimator (ROMP/PARE adapter)
+        self.processor = processor
+        self.adapter = adapter
+        self.renderer = renderer
         self.args = args
         self.identity = int(args.identity)
 
-        # One-Euro filters (global orientation + body/hand joints), persistent state.
-        oe = dict(min_cutoff=args.min_cutoff, beta=args.beta,
-                  d_cutoff=args.derivative_cutoff, freq=args.smooth_frequency)
-        FilterCls = RotationOneEuroFilter if args.filter_space == "quat" else OneEuroFilter
-        self.filt_global = FilterCls(**oe)
-        self.filt_body = FilterCls(**oe)
+        # VRSource handshake contract, forwarded from the renderer.
+        self.device = renderer.device
+        self.N_max = renderer.N_max
+        self.K = renderer.K
+        self.model_bytes = renderer.model_bytes
+        self.n_frames = 1                   # poses are live-sourced, not indexed
 
-        self.last_filtered = None          # last valid filtered pose (72,)
-        self.missing_count = 0
-        self.last_tensors = None           # last produced 5-tuple (avatar freeze on miss)
-        self.prev_raw = None               # for --debug frame-to-frame deltas
-        self.prev_filt = None
+        self.last_tensors = None            # last produced 5-tuple (freeze on miss/skip)
+        self._romp_ctr = 0                  # drives --romp-every-n skipping
+        self.window = None if args.no_window else SourceWindow(estimator.name, args)
 
-        self.win = "ROMP source (drives C++/SIBR avatar)"
-        if not args.no_window:
-            cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-
-        self._t_prev_frame = None
-        self._dt_ema = None
-        self._romp_ctr = 0                 # drives --romp-every-n skipping
-
-    # -- pose extraction + One-Euro filtering + missing handling -------------- #
-    def _get_filtered_pose(self, frame, t_now):
-        with torch.no_grad():
-            out = self.romp(frame)
-
-        raw = None
-        if out is not None and out.get("smpl_thetas", None) is not None \
-                and len(out["smpl_thetas"]) > 0:
-            raw = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
-
-        if raw is not None:
-            self.missing_count = 0
-            if self.args.smooth:
-                g = self.filt_global(raw[0:3], t_now)
-                b = self.filt_body(raw[3:72], t_now)
-                pose = np.concatenate([g, b]).astype(np.float32)
-            else:
-                pose = raw
-            self.last_filtered = pose
-            status = "OK"
-        else:
-            self.missing_count += 1
-            if self.missing_count >= self.args.reset_after:
-                self.filt_global.reset()
-                self.filt_body.reset()
-                self.last_filtered = None
-            if self.last_filtered is not None and self.missing_count <= self.args.reuse_frames:
-                pose = self.last_filtered
-                status = f"REUSE {self.missing_count}"
-            else:
-                pose = None
-                status = "NO POSE"
-
-        if self.args.debug and raw is not None:
-            rd = float(np.linalg.norm(raw - self.prev_raw)) if self.prev_raw is not None else 0.0
-            fd = (float(np.linalg.norm(pose - self.prev_filt))
-                  if (self.prev_filt is not None and pose is not None) else 0.0)
-            print(f"[SMOOTH] raw dpose={rd:7.4f}  filt dpose={fd:7.4f}  "
-                  f"miss={self.missing_count}", flush=True)
-            self.prev_raw = raw
-            self.prev_filt = pose
-
-        return pose, status
-
-    # -- deform + feature extraction (identical to MistaVRSource.produce_frame) -- #
-    def _deform_and_pack(self, cam):
-        with torch.no_grad():
-            cam_c, _ = self.converter.pose_correction(cam, self.iteration)
-            deformed_pc, _ = self.converter.deformer(
-                self.gaussians, cam_c, self.iteration, compute_loss=False
-            )
-            torch.cuda.synchronize()
-
-            feat = extract_view_indep_features(self.color_mlp, deformed_pc, cam_c)
-            R_bwd_f = extract_R_bwd(deformed_pc, self.cano, self.axis_fix)
-
-            xyz = deformed_pc.get_xyz @ self.axis_fix.T
-            if self.avatar_center0 is None:
-                self.avatar_center0 = xyz.mean(dim=0, keepdim=True).clone()
-            xyz = xyz - self.avatar_center0
-            opacity = deformed_pc.get_opacity.squeeze(-1)
-            cov6 = deformed_pc.get_covariance()
-            cov3D = cov3D_in_vr_frame(cov6, self.axis_fix)
-        return xyz, feat, R_bwd_f, opacity, cov3D
-
-    # -- source-frame window (Python-owned); q/Esc stops the server cleanly ---- #
-    def _show_source(self, frame, status, produce_ms):
-        if self.args.no_window:
-            return
-        now = time.perf_counter()
-        if self._t_prev_frame is not None:
-            dt = now - self._t_prev_frame
-            # Smooth the frame TIME (not 1/dt): averaging instantaneous rates is
-            # dominated by cheap skip frames and wildly overstates throughput.
-            # FPS = 1 / mean(dt) is the true frames-per-second.
-            self._dt_ema = dt if self._dt_ema is None else 0.9 * self._dt_ema + 0.1 * dt
-        self._t_prev_frame = now
-
-        disp = frame.copy()
-        fps = (1.0 / self._dt_ema) if self._dt_ema else 0.0
-        line1 = f"FPS: {fps:5.1f}   produce: {produce_ms:6.1f} ms   id: {self.identity}   pose: {status}"
-        sp = f" [{self.args.filter_space}]" if self.args.smooth else ""
-        nev = f"  romp 1/{self.args.romp_every_n}" if self.args.romp_every_n > 1 else ""
-        line2 = (f"smooth {'ON' if self.args.smooth else 'OFF'}{sp}{nev}  "
-                 f"miss={self.missing_count}  -> C++/SIBR viewer")
-        cv2.putText(disp, line1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(disp, line2, (10, 48), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (0, 220, 220), 1, cv2.LINE_AA)
-        if status == "NO POSE":
-            cv2.putText(disp, "No pose detected", (10, disp.shape[0] - 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.imshow(self.win, disp)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or key == 27:       # 'q' or Esc -> clean server stop
-            raise KeyboardInterrupt("source window quit")
+    def on_connect(self):
+        self.renderer.on_connect()
 
     def produce_frame(self, frame_idx: int):
         t0 = time.perf_counter()
 
         # ── Live identity switch from the C++ GUI (CTL0) -> re-decode once ─────
         if self.pending_id is not None:
-            with torch.no_grad():
-                self.scene.update_gaussians_from_migs(int(self.pending_id))
+            self.renderer.switch_identity(int(self.pending_id))
             self.identity = int(self.pending_id)
             self.pending_id = None
 
         # ── 1) Live source frame ──────────────────────────────────────────────
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            # End of video (or camera failure): stop the server cleanly.
-            raise KeyboardInterrupt("end of stream")
+        frame = self.frame_source.read()
 
-        # ── 2) Run ROMP only every Nth frame (--romp-every-n); reuse the last
-        #      avatar on the others. ROMP (~95 ms) dominates the frame, so on skip
-        #      frames we do NO ROMP and NO deform: the C++ viewer keeps rendering
-        #      the last posed buffer while the source window still advances every
-        #      frame. N=1 (default) = ROMP every frame (unchanged behavior). ─────
-        run_romp = (self._romp_ctr % self.args.romp_every_n == 0) or (self.last_tensors is None)
+        # ── 2) Run the estimator only every Nth frame (--romp-every-n); reuse the
+        #      last avatar on the others. Estimation (~95 ms) dominates the frame,
+        #      so on skip frames we do NO estimate and NO deform: the C++ viewer
+        #      keeps rendering the last posed buffer while the source window still
+        #      advances every frame. N=1 (default) = every frame (unchanged). ────
+        run_estimator = (self._romp_ctr % self.args.romp_every_n == 0) or (self.last_tensors is None)
         self._romp_ctr += 1
 
-        if run_romp:
-            # ── ROMP -> One-Euro -> pose (missing handled) -> deform + pack ─────
-            pose, status = self._get_filtered_pose(frame, t0)
+        if run_estimator:
+            # ── estimate -> One-Euro -> pose (missing handled) -> deform + pack ─
+            raw = self.estimator.estimate(frame)
+            pose, status = self.processor.process(raw, t0)
             if pose is not None:
-                rots, bone_transforms = pose_to_camera_fields(
-                    pose, self.Jtr_target, self.b02v_inv, self.device
-                )
-                cam = self.template_cam.copy()
-                cam.update(rots=rots, bone_transforms=bone_transforms)
-                cam.person_id = self.identity
-                tensors = self._deform_and_pack(cam)
+                cam = self.adapter.to_camera(pose, self.identity)
+                tensors = self.renderer.render(cam)
                 self.last_tensors = tensors
             elif self.last_tensors is not None:
                 tensors = self.last_tensors      # freeze avatar on lost target
             else:
                 # No pose yet and nothing cached: send the canonical avatar once.
-                tensors = self._deform_and_pack(self.template_cam)
+                tensors = self.renderer.render(self.adapter.canonical())
                 self.last_tensors = tensors
         else:
-            # ── Skip frame: reuse the last posed avatar (no ROMP, no deform) ────
+            # ── Skip frame: reuse the last posed avatar (no estimate, no deform) ─
             tensors = self.last_tensors
             status = f"SKIP {self._romp_ctr % self.args.romp_every_n}/{self.args.romp_every_n}"
 
         produce_ms = (time.perf_counter() - t0) * 1000.0
 
-        # ── 6) Show the source frame (same call => synced with the pose sent) ──
-        self._show_source(frame, status, produce_ms)
+        # ── 3) Show the source frame (same call => synced with the pose sent) ──
+        if self.window is not None:
+            self.window.show(frame, status, produce_ms,
+                             self.identity, self.processor.missing_count)
 
-        # ── 7) Hand the 5 attribute tensors to the server for IPC to C++ ──────
+        # ── 4) Hand the 5 attribute tensors to the server for IPC to C++ ──────
         return tensors
 
 
@@ -450,6 +188,22 @@ def parse_args():
     p.add_argument("--camera-index", type=int, default=0)
     p.add_argument("--video", type=str, default=None)
     p.add_argument("--identity", type=int, default=0, help="Target MISTA identity index (0-7).")
+    p.add_argument("--estimator", choices=["romp", "pare"], default="romp",
+                   help="Pose estimation backend. 'romp' (default) = current "
+                        "behavior; 'pare' uses the vendored PARE network.")
+
+    # PARE backend options (only used when --estimator pare). Defaults point at
+    # the weights downloaded under the vendored submodule (submodules/PARE).
+    p.add_argument("--pare-ckpt", type=str,
+                   default="submodules/PARE/data/pare/checkpoints/pare_w_3dpw_checkpoint.ckpt",
+                   help="PARE checkpoint (.ckpt). Only used with --estimator pare.")
+    p.add_argument("--pare-cfg", type=str,
+                   default="submodules/PARE/data/pare/checkpoints/pare_w_3dpw_config.yaml",
+                   help="PARE model config (.yaml). Only used with --estimator pare.")
+    p.add_argument("--pare-crop-size", type=int, default=224,
+                   help="PARE input crop size (default 224).")
+    p.add_argument("--pare-scale", type=float, default=1.0,
+                   help="PARE bbox scale factor for the full-frame crop (default 1.0).")
     p.add_argument("--load-ckpt", type=str, required=True,
                    help="Path to the MISTA 8-identity checkpoint (.pth).")
     p.add_argument("--port", type=int, default=6012,
@@ -528,46 +282,19 @@ def main():
     N_max = 50_000
     print(f"[INIT] Feature dim K={K}; ColorMLP TorchScript={len(model_bytes)} bytes.")
 
-    # ---- ROMP ----
-    # We only consume out["smpl_thetas"], so:
-    #   --show_largest : single-person post-processing only (we drive one user)
-    #   --calc_smpl    : this flag DISABLES the SMPL mesh forward (it's a
-    #                    store_false in romp), which we don't use -> saves time
-    # ONNX GPU is the real-time backend; only use it if onnxruntime actually has a
-    # working CUDA provider, else fall back to the PyTorch path (never CPU-ONNX,
-    # which is slower than PyTorch).
-    use_onnx = args.onnx
-    if use_onnx:
-        try:
-            import onnxruntime as _ort
-            if "CUDAExecutionProvider" not in _ort.get_available_providers():
-                print("[INIT] onnxruntime has no CUDAExecutionProvider; "
-                      "falling back to ROMP PyTorch backend.")
-                use_onnx = False
-        except ImportError:
-            print("[INIT] onnxruntime not installed; "
-                  "falling back to ROMP PyTorch backend.")
-            use_onnx = False
+    # ---- Pose estimator (ROMP or PARE, selected by --estimator) ----
+    # The ROMP notes still apply to its backend: we only consume the (72,)
+    # axis-angle pose, so ROMP runs --show_largest (single person) + --calc_smpl
+    # (disables the unused SMPL mesh forward) with ONNX-GPU when available.
+    estimator = build_estimator(args, device)
 
-    romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
-    if use_onnx:
-        romp_argv.append("--onnx")
-    print(f"[INIT] Initializing ROMP ({'ONNX-GPU' if use_onnx else 'PyTorch'}) ...")
-    romp_model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
-    print("[INIT] ROMP ready.")
-
-    # ---- Input source ----
-    if args.source == "webcam":
-        cap = cv2.VideoCapture(args.camera_index)
-    else:
-        cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        raise SystemExit(f"Failed to open input source ({args.source}).")
-
-    source = RompMistaVRSource(
-        scene, template_cam, Jtr_target, b02v_inv,
-        K, model_bytes, N_max, cap, romp_model, args,
-    )
+    # ---- Pipeline stages (FrameSource -> PoseEstimator -> PoseProcessor ->
+    #      MistaPoseAdapter -> MistaRenderer, orchestrated by LiveVRSource) ----
+    frame_source = FrameSource(args)
+    renderer = MistaRenderer(scene, template_cam, K, model_bytes, N_max)
+    adapter = MistaPoseAdapter(template_cam, Jtr_target, b02v_inv, renderer.device)
+    processor = PoseProcessor(args)
+    source = LiveVRSource(frame_source, estimator, processor, adapter, renderer, args)
 
     print(f"[RUN] Streaming to C++/SIBR on port {args.port}. "
           f"Start the viewer:  ...\\SIBR_remoteGaussianDesktopV42_app_rwdi.exe "
@@ -580,7 +307,7 @@ def main():
     try:
         run_server(source, port=args.port)
     finally:
-        cap.release()
+        frame_source.release()
         cv2.destroyAllWindows()
 
 
