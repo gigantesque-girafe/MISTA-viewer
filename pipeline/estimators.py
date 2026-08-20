@@ -47,12 +47,13 @@ class PoseEstimator(ABC):
 class RompEstimator(PoseEstimator):
     """Adapts romp.ROMP -> PoseEstimator. ROMP's output is already axis-angle."""
 
-    def __init__(self, romp_model):
+    def __init__(self, romp_model, name="ROMP"):
         self._model = romp_model
+        self._name = name
 
     @property
     def name(self):
-        return "ROMP"
+        return self._name
 
     def estimate(self, frame_bgr):
         with torch.no_grad():
@@ -218,35 +219,136 @@ def _construct_pare(PARE, hparams, device):
     ).to(device)
 
 
+def _prepend_trt_dll_path(trt_lib_dir):
+    """Prepend the TensorRT lib dir (+ torch/lib for cuDNN) to the process PATH.
+
+    onnxruntime's TensorRT provider loads its dependent DLLs through the PATH
+    search order, so this must run before `import onnxruntime`. torch/lib supplies
+    cuDNN 8 (and cuBLAS/cudart) that TensorRT needs.
+    """
+    parts = []
+    if trt_lib_dir and os.path.isdir(trt_lib_dir):
+        parts.append(os.path.abspath(trt_lib_dir))
+        print(f"[INIT] TensorRT lib dir on PATH: {trt_lib_dir}")
+    elif trt_lib_dir:
+        print(f"[INIT] WARNING: --trt-lib-dir '{trt_lib_dir}' does not exist.")
+    else:
+        print("[INIT] WARNING: no TensorRT lib dir given (--trt-lib-dir / "
+              "$TENSORRT_LIB_DIR); the TensorRT EP will likely fail to load.")
+    try:
+        import torch as _t
+        torch_lib = os.path.join(os.path.dirname(_t.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            parts.append(torch_lib)  # cuDNN 8 / cuBLAS / cudart for TensorRT
+    except Exception:
+        pass
+    if parts:
+        os.environ["PATH"] = os.pathsep.join(parts) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _build_romp_model(args):
+    """Construct romp.ROMP with the ONNX/CUDA/TensorRT backend selected by args.
+
+    Returns (model, label) where label describes the active backend for logging.
+
+    ONNX-GPU is ROMP's real-time path; TensorRT (--trt) routes that SAME ONNX
+    graph through onnxruntime's TensorRT execution provider for a clean A/B. We
+    set the providers EXPLICITLY after construction (ROMP hardcodes
+    [TRT, CUDA, CPU] in romp/main.py) so the non-TRT baseline is pure CUDA and
+    the TRT path carries FP16 + a persistent engine cache. We never fall back to
+    the CPU-ONNX provider (slower than ROMP's PyTorch backbone).
+    """
+    import romp  # lazy: only needed for the ROMP backend
+
+    use_onnx = args.onnx
+    use_trt = bool(getattr(args, "trt", False))
+
+    # Put TensorRT's (and cuDNN's) DLLs on PATH BEFORE onnxruntime is imported.
+    # onnxruntime's TensorRT provider (onnxruntime_providers_tensorrt.dll) resolves
+    # its dependencies (nvinfer*.dll + cuDNN) via the process PATH -- NOT via
+    # os.add_dll_directory -- so a missing entry surfaces as LoadLibrary error 126.
+    # cuDNN 8 ships inside torch/lib; ORT 1.15.x's TRT EP is happy with it (1.16.x
+    # wants cuDNN 8.9 and clashes with torch's 8.7). Must run before `import
+    # onnxruntime` so the provider sees the augmented PATH.
+    if use_trt:
+        _prepend_trt_dll_path(getattr(args, "trt_lib_dir", None))
+
+    ort = None
+    if use_onnx:
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            print("[INIT] onnxruntime not installed; "
+                  "falling back to ROMP PyTorch backend.")
+            use_onnx = use_trt = False
+    if use_onnx:
+        available = ort.get_available_providers()
+        if use_trt and "TensorrtExecutionProvider" not in available:
+            print("[INIT] onnxruntime has no TensorrtExecutionProvider; "
+                  "falling back to the CUDA ONNX backend.")
+            use_trt = False
+        if "CUDAExecutionProvider" not in available:
+            print("[INIT] onnxruntime has no CUDAExecutionProvider; "
+                  "falling back to ROMP PyTorch backend.")
+            use_onnx = use_trt = False
+
+    # Pre-seed the TensorRT EP env options BEFORE constructing ROMP, so the
+    # session ROMP builds internally (its hardcoded [TRT, CUDA, CPU] list) shares
+    # the same engine/timing cache we reuse below -- no wasted first engine build.
+    if use_trt:
+        os.makedirs(args.trt_cache_dir, exist_ok=True)
+        os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1" if args.trt_fp16 else "0"
+        os.environ["ORT_TENSORRT_ENGINE_CACHE_ENABLE"] = "1"
+        os.environ["ORT_TENSORRT_CACHE_PATH"] = args.trt_cache_dir
+        os.environ["ORT_TENSORRT_TIMING_CACHE_ENABLE"] = "1"
+
+    romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
+    if use_onnx:
+        romp_argv.append("--onnx")
+    backend = "TensorRT" if use_trt else ("ONNX-GPU" if use_onnx else "PyTorch")
+    print(f"[INIT] Initializing ROMP ({backend}) ...")
+    model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
+
+    # Rebuild the onnxruntime session with an EXPLICIT provider list so the
+    # backend is deterministic (ROMP's default list would silently prefer TRT).
+    if use_onnx:
+        if use_trt:
+            trt_opts = {
+                "trt_fp16_enable": bool(args.trt_fp16),
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": args.trt_cache_dir,
+                "trt_timing_cache_enable": True,
+            }
+            providers = [("TensorrtExecutionProvider", trt_opts),
+                         "CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        model.ort_session = ort.InferenceSession(
+            model.settings.model_onnx_path, providers=providers)
+        # get_available_providers() lists TensorRT even when its DLL can't load
+        # (missing TensorRT/cuDNN on PATH -> LoadLibrary error 126), in which case
+        # ORT silently falls back. Trust the SESSION's active provider, not the
+        # requested list, so we never mislabel a CUDA run as TensorRT.
+        active = model.ort_session.get_providers()[0]
+        print(f"[INIT] ROMP session provider: {active}")
+        if use_trt and active != "TensorrtExecutionProvider":
+            print("[INIT] WARNING: --trt requested but the TensorRT EP did not "
+                  "load (see the EP Error above); running on "
+                  f"{active} instead. Install TensorRT 8.6.x (CUDA 11.8) and put "
+                  "its libs on PATH to enable it. This run is NOT TensorRT.")
+            use_trt = False
+
+    label = "ROMP-TRT" if use_trt else "ROMP"
+    print("[INIT] ROMP ready.")
+    return model, label
+
+
 def build_estimator(args, device) -> PoseEstimator:
     """Factory: construct the selected PoseEstimator backend. Keeps main() and
     the source class free of any backend-specific imports/branching."""
     if args.estimator == "romp":
-        import romp  # lazy: only needed for the ROMP backend
-
-        # ONNX GPU is ROMP's real-time backend; only use it if onnxruntime has a
-        # working CUDA provider, else fall back to PyTorch (never CPU-ONNX, which
-        # is slower than PyTorch).
-        use_onnx = args.onnx
-        if use_onnx:
-            try:
-                import onnxruntime as _ort
-                if "CUDAExecutionProvider" not in _ort.get_available_providers():
-                    print("[INIT] onnxruntime has no CUDAExecutionProvider; "
-                          "falling back to ROMP PyTorch backend.")
-                    use_onnx = False
-            except ImportError:
-                print("[INIT] onnxruntime not installed; "
-                      "falling back to ROMP PyTorch backend.")
-                use_onnx = False
-
-        romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
-        if use_onnx:
-            romp_argv.append("--onnx")
-        print(f"[INIT] Initializing ROMP ({'ONNX-GPU' if use_onnx else 'PyTorch'}) ...")
-        model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
-        print("[INIT] ROMP ready.")
-        return RompEstimator(model)
+        model, label = _build_romp_model(args)
+        return RompEstimator(model, name=label)
 
     # PARE backend. (--onnx/--no-onnx are ROMP-only and simply don't apply here.)
     if "--onnx" in sys.argv or "--no-onnx" in sys.argv:

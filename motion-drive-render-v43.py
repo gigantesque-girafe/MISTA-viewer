@@ -226,6 +226,31 @@ def parse_args():
                    help="Force ROMP's plain PyTorch backbone instead of ONNX.")
     p.set_defaults(onnx=True)
 
+    # TensorRT backend for ROMP (A/B toggle). --trt routes ROMP's SAME ONNX model
+    # through onnxruntime's TensorRT execution provider instead of the CUDA one;
+    # the pipeline is otherwise byte-identical, so this is a clean A/B against the
+    # plain-CUDA ONNX baseline. TRT needs the ONNX model, so --trt implies ONNX.
+    # ROMP-only (ignored for --estimator pare).
+    p.add_argument("--trt", dest="trt", action="store_true",
+                   help="Run ROMP's ONNX model via the TensorRT EP (A/B vs CUDA).")
+    p.add_argument("--no-trt", dest="trt", action="store_false",
+                   help="Use the plain-CUDA ONNX baseline (default).")
+    p.set_defaults(trt=False)
+    p.add_argument("--trt-fp16", dest="trt_fp16", action="store_true",
+                   help="Enable TensorRT FP16 mode (default; big speedup).")
+    p.add_argument("--no-trt-fp16", dest="trt_fp16", action="store_false",
+                   help="Force TensorRT FP32 (numerically safer, slower).")
+    p.set_defaults(trt_fp16=True)
+    p.add_argument("--trt-cache-dir", type=str,
+                   default=os.path.join(os.path.expanduser("~"), ".romp", "trt_cache"),
+                   help="Directory for the serialized TensorRT engine + timing cache "
+                        "(built once, reused on later launches).")
+    p.add_argument("--trt-lib-dir", type=str,
+                   default=os.environ.get("TENSORRT_LIB_DIR"),
+                   help="Path to the TensorRT 8.6 (CUDA 11.8) 'lib' folder containing "
+                        "nvinfer.dll etc. Added to the DLL search path so onnxruntime's "
+                        "TensorRT EP can load. Defaults to $TENSORRT_LIB_DIR.")
+
     # One-Euro temporal smoothing (enabled by default; same flags as Phase 1).
     p.add_argument("--smooth", dest="smooth", action="store_true",
                    help="Enable One-Euro smoothing of the ROMP pose (default).")
@@ -254,6 +279,13 @@ def main():
         raise SystemExit("--identity must be in 0..7")
     if args.romp_every_n < 1:
         raise SystemExit("--romp-every-n must be >= 1")
+    if args.trt and args.estimator != "romp":
+        print("[INIT] --trt only applies to the ROMP backend; ignored for PARE.")
+    if args.trt and not args.onnx:
+        # TensorRT runs ROMP's ONNX graph; --no-onnx is incompatible. Force ONNX
+        # on (rather than aborting) so A/B scripts can just add/remove --trt.
+        print("[INIT] --trt requires the ONNX model; enabling ONNX (ignoring --no-onnx).")
+        args.onnx = True
 
     device = "cuda"
 
