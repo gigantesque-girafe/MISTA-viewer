@@ -12,8 +12,9 @@ class SourceWindow:
     'q'/Esc raises KeyboardInterrupt to stop the server cleanly.
     """
 
-    def __init__(self, estimator_name, args):
+    def __init__(self, estimator_name, args, frame_source=None):
         self.args = args
+        self.frame_source = frame_source
         self.win = f"{estimator_name} source (drives C++/SIBR avatar)"
         cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
         self._t_prev_frame = None
@@ -40,6 +41,14 @@ class SourceWindow:
                     0.6, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(disp, line2, (10, 48), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0, 220, 220), 1, cv2.LINE_AA)
+        fs = self.frame_source
+        if fs is not None:
+            mode = "DROP" if getattr(fs, "realtime", False) else "SEQ"
+            line3 = (f"cap {mode}  grabbed={getattr(fs, 'grabbed', 0)}  "
+                     f"dropped={getattr(fs, 'dropped', 0)}  "
+                     f"input-age={getattr(fs, 'last_age_ms', 0.0):5.1f} ms")
+            cv2.putText(disp, line3, (10, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 180, 255), 1, cv2.LINE_AA)
         if status == "NO POSE":
             cv2.putText(disp, "No pose detected", (10, disp.shape[0] - 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)

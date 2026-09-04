@@ -229,11 +229,14 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                     buf_idx = 1 - buf_idx
 
                     if anim_frame % _LOG_INTERVAL == 0 or anim_frame <= 3:
+                        dropped = getattr(
+                            getattr(source, "frame_source", None), "dropped", 0)
                         log.info(
                             "frame %4d  N=%d  K=%d  total=%.1fms"
-                            "  wait=%.1f  produce=%.1f  pack=%.1f  signal=%.1f",
+                            "  wait=%.1f  produce=%.1f  pack=%.1f  signal=%.1f"
+                            "  dropped=%d",
                             anim_frame, N, source.K, total_ms,
-                            wait_ms, produce_ms, pack_ms, signal_ms,
+                            wait_ms, produce_ms, pack_ms, signal_ms, dropped,
                         )
 
             except (ConnectionError, BrokenPipeError, OSError) as e:

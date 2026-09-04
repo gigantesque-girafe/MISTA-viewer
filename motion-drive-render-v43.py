@@ -61,6 +61,32 @@ import cv2
 import numpy as np
 import torch
 
+# ── Optional per-stage profiler (opt-in; zero cost unless MISTA_PROFILE=1) ──────
+# Set MISTA_PROFILE=1 to print median per-stage timings every MISTA_PROFILE_EVERY
+# frames. CUDA is async, so we torch.cuda.synchronize() around the GPU stage to
+# measure real execution time rather than kernel-launch time.
+_PROFILE = os.environ.get("MISTA_PROFILE", "0") == "1"
+_PROFILE_EVERY = int(os.environ.get("MISTA_PROFILE_EVERY", "60"))
+_PROF = {"cap": [], "est": [], "rtg": [], "rnd": [], "tot": []}
+
+
+def _prof_report():
+    import statistics as _st
+    n = len(_PROF["tot"])
+    if n == 0:
+        return
+
+    def med(k):
+        v = _PROF[k]
+        return _st.median(v) if v else 0.0
+
+    print(f"[PROFILE] n={n:>4}  capture={med('cap'):6.1f}  estimator={med('est'):6.1f}  "
+          f"retarget+cam={med('rtg'):6.1f}  deform/render={med('rnd'):6.1f}  ||  "
+          f"produce_total={med('tot'):6.1f} ms  (~{1000.0/max(med('tot'),1e-6):.1f} FPS, medians)",
+          flush=True)
+    for k in _PROF:
+        del _PROF[k][:-300]  # keep memory bounded
+
 # Make sure the MISTA package root (this file's directory) is importable, so that
 # both the repo-root modules and the `pipeline` package resolve when running this
 # script directly.
@@ -89,6 +115,8 @@ from pipeline import (
     MistaRenderer,      # [4] deforms the canonical Gaussians by that camera -> 5 attribute tensors for C++ IPC
     SourceWindow,       # [5] Python OpenCV preview of the driving frame + status overlay ('q'/Esc quits)
 )
+from pipeline.retarget import (add_retarget_args, build_retargeter,  # optional IK retarget (--retarget)
+                               source_jtr_from_betas)
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +151,38 @@ class LiveVRSource(VRSource):
 
         self.last_tensors = None            # last produced 5-tuple (freeze on miss/skip)
         self._romp_ctr = 0                  # drives --romp-every-n skipping
-        self.window = None if args.no_window else SourceWindow(estimator.name, args)
+        self.window = None if args.no_window else SourceWindow(estimator.name, args, frame_source)
+
+        # Deferred principled-retarget attach: when --retarget-mode principled is
+        # requested without --source-jtr-npz, the solver is built once the actor
+        # rest skeleton is locked from the first N valid betas (see below).
+        self._defer_retarget = (adapter.retargeter is None
+                                and args.retarget
+                                and args.retarget_mode == "principled")
+        self._betas_buf = []                # accumulates estimator.last_betas until lock
+
+    def _maybe_lock_source_skeleton(self):
+        """Collect one valid frame's betas; once N are gathered, build source_Jtr
+        and attach the principled retarget solver. No-op unless deferred."""
+        if not self._defer_retarget:
+            return
+        betas = getattr(self.estimator, "last_betas", None)
+        if betas is None:
+            return
+        self._betas_buf.append(np.asarray(betas, dtype=np.float64).reshape(-1))
+        if len(self._betas_buf) < self.args.source_betas_frames:
+            return
+        betas_mean = np.mean(np.stack(self._betas_buf, axis=0), axis=0)
+        source_Jtr = source_jtr_from_betas(betas_mean)
+        self.adapter.retargeter = build_retargeter(
+            self.args, self.adapter.Jtr_target, source_Jtr)
+        self._defer_retarget = False
+        self._betas_buf = []
+        print(f"[INIT] IK retarget ON (mode={self.args.retarget_mode}, "
+              f"foot_lock={self.args.foot_lock}, proportion={self.args.proportion}, "
+              f"ground={getattr(self.args, 'ground', True)}, "
+              f"up_axis={self.args.up_axis}); source_Jtr locked from "
+              f"{self.args.source_betas_frames} frames.", flush=True)
 
     def on_connect(self):
         self.renderer.on_connect()
@@ -138,7 +197,12 @@ class LiveVRSource(VRSource):
             self.pending_id = None
 
         # ── 1) Live source frame ──────────────────────────────────────────────
+        if _PROFILE:
+            _pc = time.perf_counter()
         frame = self.frame_source.read()
+        if _PROFILE:
+            _t_cap = (time.perf_counter() - _pc) * 1000.0
+            _t_est = _t_rtg = _t_rnd = 0.0
 
         # ── 2) Run the estimator only every Nth frame (--romp-every-n); reuse the
         #      last avatar on the others. Estimation (~95 ms) dominates the frame,
@@ -150,13 +214,35 @@ class LiveVRSource(VRSource):
 
         if run_estimator:
             # ── estimate -> One-Euro -> pose (missing handled) -> deform + pack ─
-            raw = self.estimator.estimate(frame)
-            pose, status = self.processor.process(raw, t0)
+            if _PROFILE:
+                _pe = time.perf_counter()
+            raw_pose, raw_trans = self.estimator.estimate(frame)
+            if _PROFILE:
+                _t_est = (time.perf_counter() - _pe) * 1000.0
+            pose, trans, status = self.processor.process((raw_pose, raw_trans), t0)
             if pose is not None:
-                cam = self.adapter.to_camera(pose, self.identity)
+                # Lock the actor rest skeleton and attach the principled solver once
+                # enough betas are seen (no-op unless deferred / already attached).
+                self._maybe_lock_source_skeleton()
+                # Optional deterministic IK retarget (--retarget). No-op passthrough
+                # when disabled: pose/trans unchanged, correction is None.
+                if _PROFILE:
+                    _pr = time.perf_counter()
+                pose, trans, correction = self.adapter.retarget(pose, trans)
+                cam = self.adapter.to_camera(pose, self.identity, trans,
+                                             extra_trans=correction)
+                if _PROFILE:
+                    _t_rtg = (time.perf_counter() - _pr) * 1000.0
+                    torch.cuda.synchronize()
+                    _pd = time.perf_counter()
                 tensors = self.renderer.render(cam)
+                if _PROFILE:
+                    torch.cuda.synchronize()
+                    _t_rnd = (time.perf_counter() - _pd) * 1000.0
                 self.last_tensors = tensors
             elif self.last_tensors is not None:
+                if self.adapter.retargeter is not None:
+                    self.adapter.retargeter.reset()   # drop stale foot locks
                 tensors = self.last_tensors      # freeze avatar on lost target
             else:
                 # No pose yet and nothing cached: send the canonical avatar once.
@@ -168,6 +254,15 @@ class LiveVRSource(VRSource):
             status = f"SKIP {self._romp_ctr % self.args.romp_every_n}/{self.args.romp_every_n}"
 
         produce_ms = (time.perf_counter() - t0) * 1000.0
+
+        if _PROFILE and run_estimator:
+            _PROF["cap"].append(_t_cap)
+            _PROF["est"].append(_t_est)
+            _PROF["rtg"].append(_t_rtg)
+            _PROF["rnd"].append(_t_rnd)
+            _PROF["tot"].append(produce_ms)
+            if len(_PROF["tot"]) % _PROFILE_EVERY == 0:
+                _prof_report()
 
         # ── 3) Show the source frame (same call => synced with the pose sent) ──
         if self.window is not None:
@@ -187,10 +282,23 @@ def parse_args():
     p.add_argument("--source", choices=["webcam", "video"], default="webcam")
     p.add_argument("--camera-index", type=int, default=0)
     p.add_argument("--video", type=str, default=None)
+    p.add_argument("--realtime", choices=["auto", "on", "off"], default="auto",
+                   help="Drop stale frames to track a live source in realtime. "
+                        "A background thread keeps only the newest captured "
+                        "frame, so the (slower) pipeline never falls behind. "
+                        "auto = on for --source webcam, off for --source video.")
+    p.add_argument("--camera-fps", type=float, default=None,
+                   help="Best-effort webcam capture FPS (CAP_PROP_FPS). "
+                        "Ignored by backends that don't honor it.")
+    p.add_argument("--camera-width", type=int, default=None,
+                   help="Best-effort webcam capture width (CAP_PROP_FRAME_WIDTH).")
+    p.add_argument("--camera-height", type=int, default=None,
+                   help="Best-effort webcam capture height (CAP_PROP_FRAME_HEIGHT).")
     p.add_argument("--identity", type=int, default=0, help="Target MISTA identity index (0-7).")
-    p.add_argument("--estimator", choices=["romp", "pare"], default="romp",
+    p.add_argument("--estimator", choices=["romp", "pare", "hybrik"], default="romp",
                    help="Pose estimation backend. 'romp' (default) = current "
-                        "behavior; 'pare' uses the vendored PARE network.")
+                        "behavior; 'pare' uses the vendored PARE network; 'hybrik' "
+                        "uses the vendored HybrIK network (higher accuracy, slower).")
 
     # PARE backend options (only used when --estimator pare). Defaults point at
     # the weights downloaded under the vendored submodule (submodules/PARE).
@@ -204,6 +312,18 @@ def parse_args():
                    help="PARE input crop size (default 224).")
     p.add_argument("--pare-scale", type=float, default=1.0,
                    help="PARE bbox scale factor for the full-frame crop (default 1.0).")
+
+    # HybrIK backend options (only used when --estimator hybrik). Defaults point at
+    # the ResNet-34 config + checkpoint (the light backbone — usable on the RTX 1080;
+    # swap to an HRNet-W48 config/ckpt for max accuracy at lower FPS). Files live
+    # under the vendored submodule (submodules/HybrIK).
+    p.add_argument("--hybrik-ckpt", type=str,
+                   default="submodules/HybrIK/pretrained_models/hybrik_res34.pth",
+                   help="HybrIK checkpoint (.pth). Only used with --estimator hybrik.")
+    p.add_argument("--hybrik-cfg", type=str,
+                   default="submodules/HybrIK/configs/256x192_adam_lr1e-3-res34_smpl_3d_cam_2x_mix_w_pw3d.yaml",
+                   help="HybrIK model config (.yaml). Only used with --estimator hybrik. "
+                        "Must match the checkpoint (default = the ResNet-34 w/ 3DPW cfg).")
     p.add_argument("--load-ckpt", type=str, required=True,
                    help="Path to the MISTA 8-identity checkpoint (.pth).")
     p.add_argument("--port", type=int, default=6012,
@@ -268,7 +388,64 @@ def parse_args():
     p.add_argument("--reset-after", type=int, default=30)
     p.add_argument("--debug", action="store_true",
                    help="Print raw vs filtered frame-to-frame pose deltas.")
+
+    # Root motion: thread ROMP's cam_trans into bone_transforms so a walk
+    # translates the avatar instead of rendering in place. Off by default; the
+    # cam_trans -> canonical-frame mapping is tunable live via the flags below.
+    p.add_argument("--root-motion", action="store_true",
+                   help="Drive avatar translation from the estimator's cam_trans "
+                        "(ROMP only). Default off = pinned root (in-place).")
+    p.add_argument("--root-scale", type=float, default=1.0,
+                   help="Scalar applied to cam_trans before adding to the root.")
+    p.add_argument("--root-axis", type=str, default="x,y,z",
+                   help="Axis permute+sign mapping cam_trans -> canonical frame, "
+                        "e.g. 'x,y,z' (identity) or 'x,-z,y'.")
+    p.add_argument("--root-horizontal", action="store_true",
+                   help="Zero the depth (Z) component after mapping: keep only "
+                        "ground-plane walking, drop noisy toward/away motion.")
+
+    # Deterministic IK retargeting (A/B toggle). Off by default = current
+    # pipeline unchanged (the "A" arm). --retarget enables the "B" arm: foot
+    # contact / anti-skate + proportion retarget between the filter and adapter.
+    add_retarget_args(p)
     return p.parse_args()
+
+
+def build_trans_xform(args):
+    """Closure mapping a raw (3,) cam_trans into the canonical frame, or None.
+
+    Returns None unless --root-motion is set (so the adapter pins the root).
+    Applies, in order: axis permute+sign (--root-axis), scale (--root-scale),
+    and optional depth zeroing (--root-horizontal).
+    """
+    if not args.root_motion:
+        return None
+
+    idx, sign = [], []
+    for tok in args.root_axis.split(","):
+        tok = tok.strip().lower()
+        s = -1.0 if tok.startswith("-") else 1.0
+        axis = tok.lstrip("+-")
+        if axis not in ("x", "y", "z"):
+            raise SystemExit(f"--root-axis: bad token '{tok}' (use x/y/z with optional -)")
+        idx.append({"x": 0, "y": 1, "z": 2}[axis])
+        sign.append(s)
+    if len(idx) != 3:
+        raise SystemExit("--root-axis must have exactly 3 comma-separated axes")
+
+    idx = np.asarray(idx, dtype=np.int64)
+    sign = np.asarray(sign, dtype=np.float32)
+    scale = float(args.root_scale)
+    horizontal = args.root_horizontal
+
+    def xform(trans):
+        t = np.asarray(trans, dtype=np.float32).reshape(-1)
+        out = (t[idx] * sign) * scale
+        if horizontal:
+            out[2] = 0.0
+        return out.astype(np.float32)
+
+    return xform
 
 
 def main():
@@ -280,7 +457,15 @@ def main():
     if args.romp_every_n < 1:
         raise SystemExit("--romp-every-n must be >= 1")
     if args.trt and args.estimator != "romp":
-        print("[INIT] --trt only applies to the ROMP backend; ignored for PARE.")
+        print(f"[INIT] --trt only applies to the ROMP backend; ignored for "
+              f"{args.estimator}.")
+    if args.root_motion and args.estimator == "hybrik" and not args.root_horizontal:
+        print("[INIT] --root-motion with HybrIK: X and vertical motion track ROMP, "
+              "but HybrIK's monocular depth (Z) is noisy. Add --root-horizontal to "
+              "drop depth for a clean jump/lateral drive.")
+    if args.root_motion and args.estimator == "pare":
+        print("[INIT] --root-motion needs a world translation; the PARE backend "
+              "returns none, so the root stays pinned for this backend.")
     if args.trt and not args.onnx:
         # TensorRT runs ROMP's ONNX graph; --no-onnx is incompatible. Force ONNX
         # on (rather than aborting) so A/B scripts can just add/remove --trt.
@@ -324,7 +509,30 @@ def main():
     #      MistaPoseAdapter -> MistaRenderer, orchestrated by LiveVRSource) ----
     frame_source = FrameSource(args)
     renderer = MistaRenderer(scene, template_cam, K, model_bytes, N_max)
-    adapter = MistaPoseAdapter(template_cam, Jtr_target, b02v_inv, renderer.device)
+    trans_xform = build_trans_xform(args)
+    if trans_xform is not None:
+        print(f"[INIT] Root motion ON (scale={args.root_scale}, axis={args.root_axis}, "
+              f"horizontal={args.root_horizontal}).")
+    # Principled proportion retarget needs the actor rest skeleton (source_Jtr).
+    # With --source-jtr-npz it is known up front; otherwise it is locked from the
+    # first N valid frames of live betas (LiveVRSource._maybe_lock_source_skeleton),
+    # so the solver is attached lazily and the pose path is unchanged until then.
+    source_Jtr = None
+    principled = args.retarget and args.retarget_mode == "principled"
+    if principled and args.source_jtr_npz:
+        source_Jtr = np.asarray(np.load(args.source_jtr_npz)["Jtr"], dtype=np.float64)
+        print(f"[INIT] Loaded source_Jtr from {args.source_jtr_npz}.")
+    defer_retarget = principled and source_Jtr is None
+    retargeter = None if defer_retarget else build_retargeter(args, Jtr_target, source_Jtr)
+    if retargeter is not None:
+        print(f"[INIT] IK retarget ON (mode={args.retarget_mode}, "
+              f"foot_lock={args.foot_lock}, proportion={args.proportion}, "
+              f"ground={getattr(args, 'ground', True)}, up_axis={args.up_axis}).")
+    elif defer_retarget:
+        print(f"[INIT] IK retarget (principled) pending: locking actor betas over "
+              f"the first {args.source_betas_frames} valid frames ...")
+    adapter = MistaPoseAdapter(template_cam, Jtr_target, b02v_inv, renderer.device,
+                               trans_xform=trans_xform, retargeter=retargeter)
     processor = PoseProcessor(args)
     source = LiveVRSource(frame_source, estimator, processor, adapter, renderer, args)
 

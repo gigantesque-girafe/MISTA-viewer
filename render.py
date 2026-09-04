@@ -61,6 +61,10 @@ def build_scene(config):
         sd  = tmp["migs_module_state_dict"]
 
         migs_type = tmp.get("migs_type", config.migs.type)
+        # Normalize legacy labels: older checkpoints saved the generic "tt"
+        # for standard 5D TT models. Map it to the current registry key.
+        _MIGS_TYPE_ALIASES = {"tt": "tt5d"}
+        migs_type = _MIGS_TYPE_ALIASES.get(migs_type, migs_type)
         print("[CHECKPOINT] Detected migs_type =", migs_type)
         config.migs.type = migs_type
 
