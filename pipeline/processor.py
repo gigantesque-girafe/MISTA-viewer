@@ -29,6 +29,8 @@ class PoseProcessor:
         self.missing_count = 0
         self.prev_raw = None               # for --debug frame-to-frame deltas
         self.prev_filt = None
+        self._head_csv = None              # lazy file handle for --debug-head-csv
+        self._head_frame = 0               # frame counter for the head diagnostic
 
     def process(self, raw, t_now):
         """((raw_pose (72,)|None, raw_trans (3,)|None), timestamp)
@@ -74,4 +76,50 @@ class PoseProcessor:
             self.prev_raw = raw_pose
             self.prev_filt = pose
 
+        if getattr(self.args, "debug_head", False) and raw_pose is not None:
+            self._debug_head(raw_pose, pose)
+
         return pose, trans, status
+
+    def _debug_head(self, raw_pose, pose):
+        """Log neck(12)/head(15) rotation magnitude + yaw, raw vs filtered.
+
+        Diagnostic only (guarded by --debug-head). The yaw proxy is the SMPL-local
+        Y-axis component of the axis-angle in degrees: a head left/right turn is a
+        rotation about the body-up axis (~Y in SMPL local frame), so this tracks the
+        over-the-shoulder turn. SMPL splits a head turn across neck(12)+head(15), so
+        we also report the summed yaw.
+        """
+        def aa(p, j):
+            return None if p is None else np.asarray(p[3 * j:3 * j + 3], dtype=np.float32)
+
+        def mag(v):
+            return 0.0 if v is None else float(np.rad2deg(np.linalg.norm(v)))
+
+        def yaw(v):
+            return 0.0 if v is None else float(np.rad2deg(v[1]))
+
+        nr, hr = aa(raw_pose, 12), aa(raw_pose, 15)
+        nf, hf = aa(pose, 12), aa(pose, 15)
+        sum_yaw_raw = yaw(nr) + yaw(hr)
+        sum_yaw_filt = yaw(nf) + yaw(hf)
+        print(f"[HEAD] neck raw={mag(nr):5.1f}deg(yaw {yaw(nr):+6.1f}) "
+              f"filt={mag(nf):5.1f}deg(yaw {yaw(nf):+6.1f})  "
+              f"head raw={mag(hr):5.1f}deg(yaw {yaw(hr):+6.1f}) "
+              f"filt={mag(hf):5.1f}deg(yaw {yaw(hf):+6.1f})  "
+              f"sum_yaw raw={sum_yaw_raw:+6.1f} filt={sum_yaw_filt:+6.1f}", flush=True)
+
+        csv_path = getattr(self.args, "debug_head_csv", None)
+        if csv_path:
+            if self._head_csv is None:
+                self._head_csv = open(csv_path, "w", newline="")
+                self._head_csv.write(
+                    "frame,neck_raw_deg,neck_raw_yaw,neck_filt_deg,neck_filt_yaw,"
+                    "head_raw_deg,head_raw_yaw,head_filt_deg,head_filt_yaw,"
+                    "sum_yaw_raw,sum_yaw_filt\n")
+            self._head_csv.write(
+                f"{self._head_frame},{mag(nr):.3f},{yaw(nr):.3f},{mag(nf):.3f},{yaw(nf):.3f},"
+                f"{mag(hr):.3f},{yaw(hr):.3f},{mag(hf):.3f},{yaw(hf):.3f},"
+                f"{sum_yaw_raw:.3f},{sum_yaw_filt:.3f}\n")
+            self._head_csv.flush()
+        self._head_frame += 1

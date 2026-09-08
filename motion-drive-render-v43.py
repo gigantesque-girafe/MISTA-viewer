@@ -117,6 +117,7 @@ from pipeline import (
 )
 from pipeline.retarget import (add_retarget_args, build_retargeter,  # optional IK retarget (--retarget)
                                source_jtr_from_betas)
+from pipeline import camera as _camera   # PnP + intrinsics for --retarget-mode reproj
 
 
 # --------------------------------------------------------------------------- #
@@ -133,13 +134,19 @@ class LiveVRSource(VRSource):
     frame, and hands the 5-tuple back to run_server for IPC to C++.
     """
 
-    def __init__(self, frame_source, estimator, processor, adapter, renderer, args):
+    def __init__(self, frame_source, estimator, processor, adapter, renderer, args,
+                 head_pose=None):
         self.frame_source = frame_source
         self.estimator = estimator          # PoseEstimator (ROMP/PARE adapter)
         self.processor = processor
         self.adapter = adapter
         self.renderer = renderer
         self.args = args
+        # Optional face-driven head pose; overrides SMPL neck+head on the raw pose
+        # before smoothing. None => estimator's head joints used as-is.
+        self.head_pose = head_pose
+        # Zero-dep head-yaw amplification of the estimator's own neck/head joints.
+        self.head_amplify = bool(getattr(args, "head_amplify", False))
         self.identity = int(args.identity)
 
         # VRSource handshake contract, forwarded from the renderer.
@@ -161,6 +168,17 @@ class LiveVRSource(VRSource):
                                 and args.retarget_mode == "principled")
         self._betas_buf = []                # accumulates estimator.last_betas until lock
 
+        # 2D-reprojection retarget (--retarget-mode reproj): per-frame PnP camera
+        # from the avatar's posed joints <-> the estimator's 2D keypoints, fed to the
+        # retargeter so it can solve the legs onto the (reliable) 2D. Seed each PnP
+        # from the previous solution and One-Euro smooth the camera (reusing the pose
+        # smoothing cutoffs) so a noisy per-frame solve doesn't jitter the target.
+        self._reproj_on = bool(args.retarget and args.retarget_mode == "reproj")
+        self._pnp_prev = (None, None)       # (rvec, tvec) seed for temporal continuity
+        self._cam_smoother = (_camera.CameraSmoother(
+            args.smooth_frequency, args.min_cutoff, args.beta)
+            if (self._reproj_on and args.smooth) else None)
+
     def _maybe_lock_source_skeleton(self):
         """Collect one valid frame's betas; once N are gathered, build source_Jtr
         and attach the principled retarget solver. No-op unless deferred."""
@@ -179,10 +197,41 @@ class LiveVRSource(VRSource):
         self._defer_retarget = False
         self._betas_buf = []
         print(f"[INIT] IK retarget ON (mode={self.args.retarget_mode}, "
-              f"foot_lock={self.args.foot_lock}, proportion={self.args.proportion}, "
-              f"ground={getattr(self.args, 'ground', True)}, "
-              f"up_axis={self.args.up_axis}); source_Jtr locked from "
+              f"proportion={self.args.proportion}, "
+              f"limb_scale={getattr(self.args, 'limb_scale', 1.0)}); "
+              f"source_Jtr locked from "
               f"{self.args.source_betas_frames} frames.", flush=True)
+
+    def _set_reproj_observation(self, pose, frame):
+        """reproj mode: solve a per-frame PnP camera from the avatar's posed joints
+        <-> the estimator's 2D keypoints and hand it (with the 2D targets) to the
+        retargeter. On any failure, clear the observation so reproj passes through
+        (never freezes the avatar). Mirrors motion-drive-composite.py's PnP block."""
+        rt = getattr(self.adapter, "retargeter", None)
+        if rt is None:
+            return
+        pj2d = getattr(self.estimator, "last_pj2d", None)
+        if pj2d is None:
+            rt.set_observation(None, None, None, None, None)
+            return
+        H, W = frame.shape[:2]
+        K, _f = _camera.romp_intrinsics(W, H)
+        joints3d = self.adapter.posed_joints(pose)                      # (24,3)
+        pairs = getattr(self.estimator, "pj2d_smpl_map", None) \
+            or [(i, i) for i in range(min(24, len(pj2d)))]
+        pairs = [(r, s) for (r, s) in pairs if r < len(pj2d) and s < len(joints3d)]
+        R = t = None
+        if len(pairs) >= 6:
+            obj3d = joints3d[[s for _, s in pairs]]
+            img2d = pj2d[[r for r, _ in pairs]]
+            prev_rvec, prev_tvec = self._pnp_prev
+            R, t, rt_seed = _camera.solve_pnp(obj3d, img2d, K, use_ransac=True,
+                                              prev_rvec=prev_rvec, prev_tvec=prev_tvec)
+            if R is not None:
+                self._pnp_prev = rt_seed                                # seed next solve (RAW)
+                if self._cam_smoother is not None:
+                    R, t = self._cam_smoother(R, t)
+        rt.set_observation(K, R, t, pj2d, pairs)
 
     def on_connect(self):
         self.renderer.on_connect()
@@ -219,6 +268,14 @@ class LiveVRSource(VRSource):
             raw_pose, raw_trans = self.estimator.estimate(frame)
             if _PROFILE:
                 _t_est = (time.perf_counter() - _pe) * 1000.0
+            # Amplify the estimator's own neck+head yaw before smoothing (--head-amplify).
+            if self.head_amplify and raw_pose is not None:
+                from pipeline.headpose import amplify_head_yaw
+                raw_pose = amplify_head_yaw(raw_pose, self.args.head_amplify_gain,
+                                            self.args.head_amplify_max)
+            # Override neck(12)+head(15) from the face before smoothing (--head-pose).
+            if self.head_pose is not None and raw_pose is not None:
+                raw_pose = self.head_pose.apply(raw_pose, frame)
             pose, trans, status = self.processor.process((raw_pose, raw_trans), t0)
             if pose is not None:
                 # Lock the actor rest skeleton and attach the principled solver once
@@ -228,6 +285,9 @@ class LiveVRSource(VRSource):
                 # when disabled: pose/trans unchanged, correction is None.
                 if _PROFILE:
                     _pr = time.perf_counter()
+                # reproj mode: attach this frame's PnP camera + 2D targets first.
+                if self._reproj_on:
+                    self._set_reproj_observation(pose, frame)
                 pose, trans, correction = self.adapter.retarget(pose, trans)
                 cam = self.adapter.to_camera(pose, self.identity, trans,
                                              extra_trans=correction)
@@ -388,6 +448,61 @@ def parse_args():
     p.add_argument("--reset-after", type=int, default=30)
     p.add_argument("--debug", action="store_true",
                    help="Print raw vs filtered frame-to-frame pose deltas.")
+    p.add_argument("--debug-head", action="store_true",
+                   help="Print per-frame neck(12)/head(15) rotation magnitude and "
+                        "yaw (raw vs filtered) to diagnose under-rotated head turns.")
+    p.add_argument("--debug-head-csv", type=str, default=None,
+                   help="Optional CSV path to log the --debug-head values per frame "
+                        "for offline plotting.")
+
+    # Head-yaw amplification (zero-dep): scale the estimator's OWN neck+head yaw,
+    # which is correctly-signed but too small. Independent of --head-pose (face).
+    p.add_argument("--head-amplify", action="store_true",
+                   help="Amplify the estimator's own neck(12)+head(15) yaw (no face "
+                        "detection, no new deps). Correct sign, no twitch; limited range.")
+    p.add_argument("--head-amplify-gain", type=float, default=6.0,
+                   help="Multiplier on the estimator's head/neck yaw (--head-amplify).")
+    p.add_argument("--head-amplify-max", type=float, default=45.0,
+                   help="Clamp (deg) on each amplified joint's yaw (--head-amplify).")
+
+    # Face-driven head pose (YuNet + solvePnP). Body estimators collapse head yaw,
+    # so this OVERRIDES SMPL neck(12)+head(15) from the face. Off by default.
+    p.add_argument("--head-pose", action="store_true",
+                   help="Drive the avatar's neck+head from a face-pose source "
+                        "(YuNet + solvePnP), overriding the estimator's head joints.")
+    p.add_argument("--head-yunet-model", type=str, default=None,
+                   help="Path to face_detection_yunet_2023mar.onnx (OpenCV Zoo). "
+                        "Required with --head-pose.")
+    p.add_argument("--head-gain", type=float, default=1.0,
+                   help="Scalar applied to the face-derived head angles.")
+    p.add_argument("--head-split", type=float, default=0.5,
+                   help="Fraction of the head turn assigned to the neck joint (12); "
+                        "the rest goes to the head joint (15).")
+    p.add_argument("--head-neutral-frames", type=int, default=15,
+                   help="Frames used to auto-calibrate the frontal neutral (assumes "
+                        "the actor starts roughly facing the camera).")
+    p.add_argument("--head-max-deg", type=float, default=70.0,
+                   help="Clamp on each head angle (deg) before gain.")
+    p.add_argument("--head-ema", type=float, default=0.5,
+                   help="EMA factor for the face angles (0<..<=1; lower = smoother, "
+                        "more lag). Suppresses solvePnP jitter/twitches.")
+    p.add_argument("--head-slew-deg", type=float, default=12.0,
+                   help="Max change per processed frame (deg) for the face yaw; "
+                        "lower = fewer twitches but slower fast turns.")
+    p.add_argument("--head-a-max", type=float, default=1.0,
+                   help="Reject a face frame whose nose/eye asymmetry exceeds this "
+                        "(|a|>a_max = garbage/near-profile landmarks); the head holds "
+                        "its last value instead of snapping. Lower = stricter.")
+    p.add_argument("--head-reset-after", type=int, default=30,
+                   help="Consecutive no-face frames before the head recenters to the "
+                        "body pose and the frontal neutral recalibrates. Below this, "
+                        "the last head yaw is held (no twitch on brief detection drops).")
+    p.add_argument("--head-yaw-sign", type=float, choices=[1.0, -1.0], default=1.0,
+                   help="Sign for the yaw axis (flip if the head turns the wrong way).")
+    p.add_argument("--head-pitch-sign", type=float, choices=[1.0, -1.0], default=1.0,
+                   help="(Unused: yaw-only head driving.)")
+    p.add_argument("--head-roll-sign", type=float, choices=[1.0, -1.0], default=1.0,
+                   help="(Unused: yaw-only head driving.)")
 
     # Root motion: thread ROMP's cam_trans into bone_transforms so a walk
     # translates the avatar instead of rendering in place. Off by default; the
@@ -526,15 +641,34 @@ def main():
     retargeter = None if defer_retarget else build_retargeter(args, Jtr_target, source_Jtr)
     if retargeter is not None:
         print(f"[INIT] IK retarget ON (mode={args.retarget_mode}, "
-              f"foot_lock={args.foot_lock}, proportion={args.proportion}, "
-              f"ground={getattr(args, 'ground', True)}, up_axis={args.up_axis}).")
+              f"proportion={args.proportion}, "
+              f"limb_scale={getattr(args, 'limb_scale', 1.0)}).")
     elif defer_retarget:
         print(f"[INIT] IK retarget (principled) pending: locking actor betas over "
               f"the first {args.source_betas_frames} valid frames ...")
     adapter = MistaPoseAdapter(template_cam, Jtr_target, b02v_inv, renderer.device,
                                trans_xform=trans_xform, retargeter=retargeter)
     processor = PoseProcessor(args)
-    source = LiveVRSource(frame_source, estimator, processor, adapter, renderer, args)
+    if args.head_amplify:
+        print(f"[INIT] Head-yaw amplify ON (gain={args.head_amplify_gain}, "
+              f"max_deg={args.head_amplify_max}).")
+    # Optional face-driven head pose (overrides SMPL neck+head; --head-pose).
+    head_pose = None
+    if args.head_pose:
+        from pipeline.headpose import FaceHeadPose
+        head_pose = FaceHeadPose(
+            args.head_yunet_model, gain=args.head_gain, split=args.head_split,
+            signs=(args.head_yaw_sign, args.head_pitch_sign, args.head_roll_sign),
+            neutral_frames=args.head_neutral_frames, max_deg=args.head_max_deg,
+            ema=args.head_ema, slew_deg=args.head_slew_deg,
+            reset_after=args.head_reset_after, a_max=args.head_a_max,
+            debug=args.debug_head)
+        print(f"[INIT] Face head-pose ON (yaw-only, gain={args.head_gain}, "
+              f"split={args.head_split}, neutral_frames={args.head_neutral_frames}, "
+              f"ema={args.head_ema}, slew_deg={args.head_slew_deg}, "
+              f"reset_after={args.head_reset_after}).")
+    source = LiveVRSource(frame_source, estimator, processor, adapter, renderer, args,
+                          head_pose=head_pose)
 
     print(f"[RUN] Streaming to C++/SIBR on port {args.port}. "
           f"Start the viewer:  ...\\SIBR_remoteGaussianDesktopV42_app_rwdi.exe "

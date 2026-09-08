@@ -253,153 +253,15 @@ def _tensor_to_bgr_u8(rgb_chw):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-# ROMP's virtual camera: focal 443.4 px on the 512x512 padded-square input, principal
-# point at the center (romp/post_parser.py:100). ROMP pads the original frame to a
-# max(H,W) square (centered) then resizes to 512, so on the ORIGINAL frame the effective
-# focal scales by max(H,W)/512 and the principal point maps to the image center.
-_ROMP_FOCAL_512 = 443.4
-_ROMP_INPUT = 512.0
-
-
-def _romp_intrinsics(W, H):
-    """(K 3x3, fx) for ROMP's camera mapped onto an original WxH frame."""
-    f = _ROMP_FOCAL_512 * max(W, H) / _ROMP_INPUT
-    K = np.array([[f, 0.0, W * 0.5],
-                  [0.0, f, H * 0.5],
-                  [0.0, 0.0, 1.0]], dtype=np.float64)
-    return K, f
-
-
-def _solve_pnp(joints3d, joints2d, K, use_ransac=True, prev_rvec=None, prev_tvec=None):
-    """Image-aligned camera (R 3x3, t 3) from 3D<->2D SMPL joint correspondences.
-
-    Returns (R, t) in the OpenCV world->camera convention (X_cam = R X_world + t),
-    which is also 3dgs's camera convention, or None if PnP fails. Seeds with the
-    previous solution (temporal continuity) when available.
-    """
-    obj = np.ascontiguousarray(joints3d[:, None, :].astype(np.float64))   # (N,1,3)
-    img = np.ascontiguousarray(joints2d[:, None, :].astype(np.float64))   # (N,1,2)
-    dist = np.zeros((4, 1))
-
-    # Global solver first (no initial guess, no divergence): SQPNP if available, else EPNP.
-    # SOLVEPNP_ITERATIVE was diverging here (object collapsing behind the camera), so we
-    # use a globally-convergent solver and only refine it iteratively afterwards.
-    global_flag = getattr(cv2, "SOLVEPNP_SQPNP", cv2.SOLVEPNP_EPNP)
-    ok = False
-    rvec = tvec = None
-    try:
-        if use_ransac and len(joints3d) >= 6:
-            ok, rvec, tvec, _ = cv2.solvePnPRansac(
-                obj, img, K, dist, reprojectionError=12.0, iterationsCount=100,
-                confidence=0.99, flags=cv2.SOLVEPNP_EPNP)
-        if not ok:                       # RANSAC off, or RANSAC failed -> global solver
-            ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=global_flag)
-    except cv2.error:
-        return None, None, None
-    if not ok:
-        return None, None, None
-
-    # Refine the global solution (guarded: keep it only if refinement stays sane).
-    try:
-        ok2, rvec2, tvec2 = cv2.solvePnP(
-            obj, img, K, dist, flags=cv2.SOLVEPNP_ITERATIVE,
-            useExtrinsicGuess=True, rvec=rvec.copy(), tvec=tvec.copy())
-        if ok2 and tvec2.reshape(3)[2] > 0:      # positive depth = in front of camera
-            rvec, tvec = rvec2, tvec2
-    except cv2.error:
-        pass
-
-    R, _ = cv2.Rodrigues(rvec)
-    return R.astype(np.float64), tvec.reshape(3).astype(np.float64), (rvec, tvec)
-
-
-def _mat_to_quat(R):
-    """Rotation matrix (3x3) -> unit quaternion (w,x,y,z). Dependency-free."""
-    m = R
-    tr = m[0, 0] + m[1, 1] + m[2, 2]
-    if tr > 0.0:
-        s = math.sqrt(tr + 1.0) * 2.0
-        w = 0.25 * s
-        x = (m[2, 1] - m[1, 2]) / s
-        y = (m[0, 2] - m[2, 0]) / s
-        z = (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        w = (m[2, 1] - m[1, 2]) / s
-        x = 0.25 * s
-        y = (m[0, 1] + m[1, 0]) / s
-        z = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        w = (m[0, 2] - m[2, 0]) / s
-        x = (m[0, 1] + m[1, 0]) / s
-        y = 0.25 * s
-        z = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-        w = (m[1, 0] - m[0, 1]) / s
-        x = (m[0, 2] + m[2, 0]) / s
-        y = (m[1, 2] + m[2, 1]) / s
-        z = 0.25 * s
-    q = np.array([w, x, y, z], dtype=np.float64)
-    return q / (np.linalg.norm(q) + 1e-12)
-
-
-def _quat_to_mat(q):
-    """Unit quaternion (w,x,y,z) -> rotation matrix (3x3)."""
-    w, x, y, z = q
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
-        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
-    ], dtype=np.float64)
-
-
-class _CameraSmoother:
-    """One-Euro filter for the PnP camera: quaternion on rotation, vector on tvec.
-
-    Rotation is filtered in quaternion space (hemisphere-aligned, then renormalized)
-    so it never flips or gimbal-locks; translation is filtered componentwise. Both use
-    the adaptive One-Euro cutoff (low cutoff = smooth when slow, opens up when fast),
-    matching the pose filter's stability/latency tradeoff.
-    """
-
-    def __init__(self, freq, min_cutoff, beta, dcutoff=1.0):
-        self.freq = float(freq)
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.dcutoff = float(dcutoff)
-        self.q = None          # last filtered quaternion
-        self.t = None          # last filtered tvec
-        self.dq = np.zeros(4)  # quat derivative estimate
-        self.dt = np.zeros(3)  # tvec derivative estimate
-
-    @staticmethod
-    def _alpha(cutoff, freq):
-        tau = 1.0 / (2.0 * math.pi * cutoff)
-        te = 1.0 / freq
-        return 1.0 / (1.0 + tau / te)
-
-    def _filt_vec(self, x, prev, dprev):
-        dx = (x - prev) * self.freq
-        a_d = self._alpha(self.dcutoff, self.freq)
-        dhat = a_d * dx + (1.0 - a_d) * dprev
-        speed = float(np.linalg.norm(dhat))
-        cutoff = self.min_cutoff + self.beta * speed
-        a = self._alpha(cutoff, self.freq)
-        return a * x + (1.0 - a) * prev, dhat
-
-    def __call__(self, R, t):
-        q = _mat_to_quat(R)
-        if self.q is None:
-            self.q, self.t = q, t.copy()
-            return R, t
-        if float(np.dot(q, self.q)) < 0.0:      # hemisphere-align to avoid a sign flip
-            q = -q
-        self.q, self.dq = self._filt_vec(q, self.q, self.dq)
-        self.q = self.q / (np.linalg.norm(self.q) + 1e-12)
-        self.t, self.dt = self._filt_vec(t, self.t, self.dt)
-        return _quat_to_mat(self.q), self.t.copy()
+# Image-aligned camera helpers (intrinsics, PnP, rotation smoothing) now live in
+# pipeline/camera.py so the live v43 2D-reprojection retarget solves the SAME
+# camera the same way. Imported under the original private names to keep the call
+# sites below unchanged.
+from pipeline.camera import (romp_intrinsics as _romp_intrinsics,   # noqa: E402
+                             solve_pnp as _solve_pnp,
+                             mat_to_quat as _mat_to_quat,
+                             quat_to_mat as _quat_to_mat,
+                             CameraSmoother as _CameraSmoother)
 
 
 def _build_pnp_cam_fields(R, t, W, H, f, znear, zfar, device):
@@ -550,8 +412,8 @@ def main():
     retargeter = None if defer_retarget else build_retargeter(args, Jtr_target, source_Jtr)
     if retargeter is not None:
         print(f"[INIT] IK retarget ON (mode={args.retarget_mode}, "
-              f"foot_lock={args.foot_lock}, proportion={args.proportion}, "
-              f"ground={getattr(args, 'ground', True)}, up_axis={args.up_axis}).")
+              f"proportion={args.proportion}, "
+              f"limb_scale={getattr(args, 'limb_scale', 1.0)}).")
     elif defer_retarget:
         print(f"[INIT] IK retarget (principled) pending: locking actor betas over "
               f"the first {args.source_betas_frames} valid frames ...")

@@ -62,7 +62,7 @@ class OneEuroFilter:
 
 class RotationOneEuroFilter:
     """
-    Rotation-aware One-Euro filter (duplicated verbatim from motion-driven-render.py).
+    Rotation-aware One-Euro filter.
     Filters rotations in QUATERNION space with sign (hemisphere) continuity, then
     converts back to axis-angle, avoiding the axis-angle double-cover/wrap
     discontinuities that briefly flip the avatar. Input/output are axis-angle
