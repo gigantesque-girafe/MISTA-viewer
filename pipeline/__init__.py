@@ -16,6 +16,7 @@ from pipeline.frame_source import FrameSource
 from pipeline.estimators import (
     PoseEstimator,
     RompEstimator,
+    BevEstimator,
     PareEstimator,
     build_estimator,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "FrameSource",
     "PoseEstimator",
     "RompEstimator",
+    "BevEstimator",
     "PareEstimator",
     "build_estimator",
     "PoseProcessor",

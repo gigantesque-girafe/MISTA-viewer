@@ -355,9 +355,11 @@ def parse_args():
     p.add_argument("--camera-height", type=int, default=None,
                    help="Best-effort webcam capture height (CAP_PROP_FRAME_HEIGHT).")
     p.add_argument("--identity", type=int, default=0, help="Target MISTA identity index (0-7).")
-    p.add_argument("--estimator", choices=["romp", "pare", "hybrik"], default="romp",
+    p.add_argument("--estimator", choices=["romp", "bev", "pare", "hybrik"], default="romp",
                    help="Pose estimation backend. 'romp' (default) = current "
-                        "behavior; 'pare' uses the vendored PARE network; 'hybrik' "
+                        "behavior; 'bev' uses BEV (ROMP's depth-reasoning successor; "
+                        "slower, but its HRNet backbone honors --trt/--onnx via "
+                        "onnxruntime); 'pare' uses the vendored PARE network; 'hybrik' "
                         "uses the vendored HybrIK network (higher accuracy, slower).")
 
     # PARE backend options (only used when --estimator pare). Defaults point at

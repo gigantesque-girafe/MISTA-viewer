@@ -136,6 +136,52 @@ class RompEstimator(PoseEstimator):
         return None, None
 
 
+class BevEstimator(PoseEstimator):
+    """Adapts bev.BEV -> PoseEstimator. BEV is ROMP's depth-reasoning successor; its
+    output dict uses the SAME keys as ROMP (smpl_thetas/cam_trans/smpl_betas/pj2d_org),
+    so this mirrors RompEstimator. Two BEV-specific differences: smpl_betas is 11-d
+    (SMPL-A: 10 shape + 1 kid/age offset), sliced to (10,) for the contract; and BEV
+    returns batched multi-person arrays, so we index person 0 (--show_largest keeps it
+    to the largest subject)."""
+
+    # BEV projects the SMPL-kinematic joints (its pj2d_org rows), first 24 = SMPL joint
+    # index, same convention as ROMP -> identity map for PnP alignment.
+    PJ2D_SMPL_MAP = [(i, i) for i in range(24)]
+
+    def __init__(self, bev_model, name="BEV"):
+        self._model = bev_model
+        self._name = name
+        self.last_pj2d = None
+        self.pj2d_smpl_map = self.PJ2D_SMPL_MAP
+        self.last_betas = None
+
+    @property
+    def name(self):
+        return self._name
+
+    def estimate(self, frame_bgr):
+        with torch.no_grad():
+            out = self._model(frame_bgr)
+        if out is not None and out.get("smpl_thetas", None) is not None \
+                and len(out["smpl_thetas"]) > 0:
+            thetas = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
+            trans = None
+            ct = out.get("cam_trans", None)
+            if ct is not None and len(ct) > 0:
+                trans = np.asarray(ct[0], dtype=np.float32).reshape(-1)
+            pj = out.get("pj2d_org", None)
+            self.last_pj2d = (np.asarray(pj[0], dtype=np.float32)
+                              if pj is not None and len(pj) > 0 else None)
+            bt = out.get("smpl_betas", None)
+            # BEV betas are 11-d (SMPL-A); the contract / retarget path expect (10,).
+            self.last_betas = (np.asarray(bt[0], dtype=np.float32).reshape(-1)[:10]
+                               if bt is not None and len(bt) > 0 else None)
+            return thetas, trans
+        self.last_pj2d = None
+        self.last_betas = None
+        return None, None
+
+
 class PareEstimator(PoseEstimator):
     """Adapts a PARE model -> PoseEstimator.
 
@@ -695,12 +741,184 @@ def _build_romp_model(args):
     return model, label
 
 
+class _OrtBackbone(torch.nn.Module):
+    """Drop-in replacement for BEV's HRNet backbone that runs an ONNX graph through
+    onnxruntime (CUDA or TensorRT EP) instead of PyTorch.
+
+    BEVv1.forward does `x = self.backbone(x)` and feeds that single feature map to
+    both the localization and param heads (bev/model.py:233-245). The backbone is a
+    pure static-shape CNN -- input NHWC (1,512,512,3) from romp.img_preprocess, output
+    (1,32,128,128) -- so it exports cleanly to ONNX and is the heavy part worth
+    accelerating. We keep the rest of BEV (dynamic center parsing, 3D transformer,
+    SMPL-A parser) in PyTorch. I/O crosses the GPU<->host boundary as numpy; the
+    copies (~3MB in, ~2MB out) are negligible next to the conv backbone cost.
+    """
+
+    def __init__(self, session, device, input_name, output_name):
+        super().__init__()
+        self._sess = session
+        self._device = device
+        self._in = input_name
+        self._out = output_name
+
+    def forward(self, x):
+        feats = self._sess.run([self._out],
+                               {self._in: x.detach().cpu().numpy().astype(np.float32)})[0]
+        return torch.from_numpy(feats).to(self._device)
+
+
+def _bev_backbone_onnx_path(settings):
+    """Cache the exported backbone next to BEV.pth (~/.romp/BEV_backbone.onnx)."""
+    return os.path.join(os.path.dirname(settings.model_path), "BEV_backbone.onnx")
+
+
+def _export_bev_backbone_onnx(backbone, onnx_path):
+    """Export the HRNet backbone to a static-shape ONNX graph (once; cached)."""
+    device = next(backbone.parameters()).device
+    # img_preprocess yields NHWC (1,512,512,3); the backbone permutes internally.
+    dummy = torch.zeros(1, 512, 512, 3, dtype=torch.float32, device=device)
+    print(f"[INIT] Exporting BEV backbone to ONNX at {onnx_path} ...")
+    with torch.no_grad():
+        torch.onnx.export(
+            backbone, dummy, onnx_path,
+            input_names=["image"], output_names=["feat"],
+            export_params=True, opset_version=12, do_constant_folding=True)
+
+
+def _accelerate_bev_backbone(model, args):
+    """Splice an onnxruntime (TensorRT/CUDA EP) backbone into a constructed BEV.
+
+    Reuses the SAME TRT plumbing as the ROMP path (_prepend_trt_dll_path + the
+    ORT_TENSORRT_* env + an explicit provider list) so `--estimator bev --trt
+    --trt-fp16 --trt-lib-dir ...` behaves like ROMP's --trt. Returns a backend label
+    ('BEV-TRT' / 'BEV-ONNX' / 'BEV'). Any failure falls back to the PyTorch backbone
+    so BEV still runs.
+    """
+    use_onnx = bool(getattr(args, "onnx", False))
+    use_trt = bool(getattr(args, "trt", False))
+    if not (use_onnx or use_trt):
+        return "BEV"
+
+    if use_trt:
+        _prepend_trt_dll_path(getattr(args, "trt_lib_dir", None))
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("[INIT] onnxruntime not installed; BEV backbone stays on PyTorch.")
+        return "BEV"
+
+    available = ort.get_available_providers()
+    if use_trt and "TensorrtExecutionProvider" not in available:
+        print("[INIT] onnxruntime has no TensorrtExecutionProvider; using CUDA EP for "
+              "the BEV backbone.")
+        use_trt = False
+    if "CUDAExecutionProvider" not in available:
+        print("[INIT] onnxruntime has no CUDAExecutionProvider; BEV backbone stays on "
+              "PyTorch.")
+        return "BEV"
+
+    net = model.model.module  # BEVv1 (unwrap DataParallel)
+    onnx_path = _bev_backbone_onnx_path(model.settings)
+    if not os.path.exists(onnx_path):
+        _export_bev_backbone_onnx(net.backbone, onnx_path)
+
+    if use_trt:
+        os.makedirs(args.trt_cache_dir, exist_ok=True)
+        os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1" if args.trt_fp16 else "0"
+        os.environ["ORT_TENSORRT_ENGINE_CACHE_ENABLE"] = "1"
+        os.environ["ORT_TENSORRT_CACHE_PATH"] = args.trt_cache_dir
+        os.environ["ORT_TENSORRT_TIMING_CACHE_ENABLE"] = "1"
+        trt_opts = {
+            "trt_fp16_enable": bool(args.trt_fp16),
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": args.trt_cache_dir,
+            "trt_timing_cache_enable": True,
+        }
+        providers = [("TensorrtExecutionProvider", trt_opts),
+                     "CUDAExecutionProvider", "CPUExecutionProvider"]
+        print("[INIT] Building BEV backbone TensorRT engine (first run may take a few "
+              "minutes; cached afterwards) ...")
+    else:
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    sess = ort.InferenceSession(onnx_path, providers=providers)
+    active = sess.get_providers()[0]
+    print(f"[INIT] BEV backbone session provider: {active}")
+    if use_trt and active != "TensorrtExecutionProvider":
+        print("[INIT] WARNING: --trt requested but the TensorRT EP did not load (see the "
+              f"EP Error above); running the BEV backbone on {active} instead. Put "
+              "TensorRT 8.6.x (CUDA 11.8) libs on PATH (--trt-lib-dir) to enable it.")
+        use_trt = False
+
+    device = next(net.parameters()).device
+    inp = sess.get_inputs()[0].name
+    outp = sess.get_outputs()[0].name
+    net.backbone = _OrtBackbone(sess, device, inp, outp)
+    return "BEV-TRT" if use_trt else "BEV-ONNX"
+
+
+def _build_bev_model(args):
+    """Construct bev.BEV (PyTorch backend; backbone optionally ONNX/TensorRT).
+
+    Returns (model, label). BEV shares ROMP's ~/.romp model directory. BEV.pth and
+    SMPLA_NEUTRAL.pth are the real BEV weights (auto-downloaded / already present).
+
+    SMIL (BEV's baby body model) is the one gap: it is NOT in the public ROMP release
+    (its download is commented out in bev_settings) and requires manual registration
+    with the SMIL project + packing via `bev.prepare_smil`. But SMPLA_parser only ever
+    *invokes* the SMIL model for detections flagged as babies (betas[..,10] kid offset);
+    for adult subjects -- the MISTA webcam/video use case -- it is constructed but never
+    called. So when smil_packed_info.pth is absent we point smil_path at the standard
+    SMPL_NEUTRAL.pth already in ~/.romp (same packed format, model_type='smpl'), which
+    lets BEV construct and run with identical adult output. If a real SMIL file is
+    present it is used as-is.
+
+    BEV's rendering/vis stack (Sim3DR_Cython, vis_human) pulls in a second OpenMP
+    runtime alongside torch's libiomp5md, which hard-aborts the process on Windows
+    (native exit 0xC06D007F) unless duplicates are allowed -- same guard the PARE and
+    HybrIK backends use. We also pass --render_mesh (a store_false flag: presence turns
+    OFF mesh rendering) so BEV skips the per-frame vertex render we never consume; the
+    2D joint projection (pj2d_org, used by --align) is gated by --calc_smpl, not
+    --render_mesh, so it is still produced."""
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    import bev  # lazy: only needed for the BEV backend
+
+    settings = bev.bev_settings(
+        input_args=["--GPU", "0", "--show_largest", "--calc_smpl", "--render_mesh"])
+    if not os.path.exists(settings.smil_path):
+        smpl_stub = os.path.join(os.path.dirname(settings.smpl_path), "SMPL_NEUTRAL.pth")
+        if not os.path.exists(smpl_stub):
+            raise FileNotFoundError(
+                f"BEV needs a SMIL model at {settings.smil_path} (not in the public "
+                f"ROMP release) or a fallback SMPL model at {smpl_stub}; neither exists. "
+                "Provide SMPL_NEUTRAL.pth in ~/.romp (ROMP ships it) or a real SMIL file.")
+        print(f"[INIT] SMIL model not found at {settings.smil_path}; substituting "
+              f"{smpl_stub} (baby model unused for adult subjects).")
+        settings.smil_path = smpl_stub
+
+    print("[INIT] Initializing BEV ...")
+    model = bev.BEV(settings)
+    # Optionally replace the HRNet backbone (the heavy CNN) with an onnxruntime
+    # TensorRT/CUDA session when --trt/--onnx is passed. BEV ships no ONNX graph, so
+    # we export the backbone once (cached at ~/.romp/BEV_backbone.onnx) and route only
+    # that static-shape CNN through TRT, keeping BEV's dynamic heads/parser in PyTorch.
+    label = _accelerate_bev_backbone(model, args)
+    print(f"[INIT] {label} ready.")
+    return model, label
+
+
 def build_estimator(args, device) -> PoseEstimator:
     """Factory: construct the selected PoseEstimator backend. Keeps main() and
     the source class free of any backend-specific imports/branching."""
     if args.estimator == "romp":
         model, label = _build_romp_model(args)
         return RompEstimator(model, name=label)
+
+    if args.estimator == "bev":
+        # --trt/--onnx accelerate BEV's HRNet backbone via onnxruntime (TensorRT/CUDA
+        # EP), the same stack ROMP's --trt uses; the dynamic heads stay in PyTorch.
+        model, label = _build_bev_model(args)
+        return BevEstimator(model, name=label)
 
     if args.estimator == "hybrik":
         # HybrIK's stack (like PARE's) can pull in a second OpenMP runtime; allow the
