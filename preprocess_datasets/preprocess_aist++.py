@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import json
 import argparse
@@ -90,8 +91,8 @@ def ensure_dir(p):
     return p
 
 
-def build_body_model(bm_path_neutral='body_models/smpl/neutral/model.pkl',
-                     faces_npz='body_models/misc/faces.npz'):
+def build_body_model(bm_path_neutral=body_models_path('smpl/neutral/model.pkl'),
+                     faces_npz=body_models_path('misc/faces.npz')):
     """
     Charge BodyModel (HBP) et faces SMPL.
     """

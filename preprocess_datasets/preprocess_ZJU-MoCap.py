@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import torch
 import trimesh
@@ -37,9 +38,9 @@ if __name__ == '__main__':
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-    body_model = BodyModel(bm_path='body_models/smpl/neutral/model.pkl', num_betas=10, batch_size=1).cuda()
+    body_model = BodyModel(bm_path=body_models_path('smpl/neutral/model.pkl'), num_betas=10, batch_size=1).cuda()
 
-    faces = np.load('body_models/misc/faces.npz')['faces']
+    faces = np.load(body_models_path('misc/faces.npz'))['faces']
 
     if seq_name in ['CoreView_313', 'CoreView_315']:
         cam_names = list(range(1, 20)) + [22, 23]

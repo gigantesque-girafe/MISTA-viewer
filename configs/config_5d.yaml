@@ -20,7 +20,7 @@ exp_name: multi_zju_5d-${pose_name}-${rigid_name}-${non_rigid_name}-${texture_na
 tag: default
 
 exp_dir: ${exp_root}/${exp_name}
-smpl_uv_npz: "/src/body_models/misc/smpl_uv_coords.npz"
+smpl_uv_npz: "${oc.env:MISTA_BODY_MODELS,body_models}/misc/smpl_uv_coords.npz"
 
 model:
   gaussian:

@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import math
 import numpy as np
 import torch
@@ -67,7 +68,7 @@ def get_soldier_bone_transforms(
     arm_down_deg=55.0,    # bras vers le bas (soldat)
     clav_gap_deg=4.0,     # petit espace bras/torse via clavicule
     down_axis="z",        # axe de "descente" (souvent z ou x selon ton repère)
-    kintree_path="body_models/misc/kintree_table.npy",
+    kintree_path=body_models_path("misc/kintree_table.npy"),
 ):
     # parents SMPL
     kintree = np.load(kintree_path)        # shape (2,24)

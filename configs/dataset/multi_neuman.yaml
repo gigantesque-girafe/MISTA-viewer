@@ -16,7 +16,7 @@ dataset:
     # - neuman_lab
     # - neuman_parkinglot
     # - neuman_seattle
-  smpl_uv_npz: "/src/body_models/misc/smpl_uv_coords.npz"
+  smpl_uv_npz: "${oc.env:MISTA_BODY_MODELS,body_models}/misc/smpl_uv_coords.npz"
   
 # migs:
 #   type: tt4d_uv

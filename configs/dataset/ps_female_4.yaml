@@ -4,7 +4,7 @@ dataset_name: ps_female_4
 
 dataset:
   name: people_snapshot
-  root_dir: "../../data/peoplesnapshot_arah-format/people_snapshot_public"
+  root_dir: "${oc.env:MISTA_DATA_ROOT}/peoplesnapshot_arah-format/people_snapshot_public"
   subject: female-4-casual
 
   train_frames: [ 0, 336, 4 ]

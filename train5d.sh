@@ -7,18 +7,20 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 # Singularity & bind
-# Path to the Singularity image
-SIF=path to your Singularity image
+# All host-side paths come from the environment (see .env.example). Override by
+# exporting these before sbatch, e.g.
+#   export MISTA_SIF=/path/to/mista.sif MISTA_DATA_ROOT=/data/zju MISTA_ROOT=$PWD
+SIF="${MISTA_SIF:?Set MISTA_SIF to your Singularity image path}"
 
-# Bind mount the dataset directory inside the container as /data/
-BIND_DATA=/path to your dataset/:/data/
+# Bind mount the host dataset dir (MISTA_DATA_ROOT) as /data/ inside the container.
+BIND_DATA="${MISTA_DATA_ROOT:?Set MISTA_DATA_ROOT to your dataset dir}:/data/"
 
-# Bind mount the source code directory inside the container as /src/
-BIND_SRC=/path to your source code/:/src/
+# Bind mount the host source dir (MISTA_ROOT, default: this repo) as /src/.
+BIND_SRC="${MISTA_ROOT:-$(cd "$(dirname "$0")" && pwd)}:/src/"
 
 # Paramètres uniques
-WANDB_PROJECT="mista"
-WANDB_API_KEY="write you're key"
+WANDB_PROJECT="${WANDB_PROJECT:-mista}"
+WANDB_API_KEY="${WANDB_API_KEY:-}"
 mkdir -p out
 
 echo "===> WANDB project: ${WANDB_PROJECT}"

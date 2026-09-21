@@ -87,6 +87,7 @@ Usage
       [--export_ply]
 """
 
+from utils.paths import body_models_path
 import os
 import json
 import shutil
@@ -319,12 +320,12 @@ def main():
     )
     ap.add_argument(
         "--bm_path",
-        default="body_models/smpl/neutral/model.pkl",
+        default=body_models_path("smpl/neutral/model.pkl"),
         help="Path to SMPL neutral body model pkl",
     )
     ap.add_argument(
         "--faces_npz",
-        default="body_models/misc/faces.npz",
+        default=body_models_path("misc/faces.npz"),
         help="Path to faces.npz",
     )
     ap.add_argument(

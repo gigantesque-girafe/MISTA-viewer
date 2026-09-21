@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,13 +95,13 @@ class PoseCorrection(nn.Module):
 
         gender = metadata['gender']
 
-        v_template = np.load('body_models/misc/v_templates.npz')[gender]
-        lbs_weights = np.load('body_models/misc/skinning_weights_all.npz')[gender]
-        posedirs = np.load('body_models/misc/posedirs_all.npz')[gender]
+        v_template = np.load(body_models_path('misc/v_templates.npz'))[gender]
+        lbs_weights = np.load(body_models_path('misc/skinning_weights_all.npz'))[gender]
+        posedirs = np.load(body_models_path('misc/posedirs_all.npz'))[gender]
         posedirs = posedirs.reshape([posedirs.shape[0] * 3, -1]).T
-        shapedirs = np.load('body_models/misc/shapedirs_all.npz')[gender]
-        J_regressor = np.load('body_models/misc/J_regressors.npz')[gender]
-        kintree_table = np.load('body_models/misc/kintree_table.npy')
+        shapedirs = np.load(body_models_path('misc/shapedirs_all.npz'))[gender]
+        J_regressor = np.load(body_models_path('misc/J_regressors.npz'))[gender]
+        kintree_table = np.load(body_models_path('misc/kintree_table.npy'))
 
         self.register_buffer('v_template', torch.tensor(v_template, dtype=torch.float32).unsqueeze(0))
         self.register_buffer('posedirs', torch.tensor(posedirs, dtype=torch.float32))

@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import glob
 import cv2
@@ -84,10 +85,10 @@ class NeuManDataset(Dataset):
         # Kept for compatibility with the same code path as ZJU/AIST++
         self.refine = False
 
-        self.faces = np.load("body_models/misc/faces.npz")["faces"]
-        self.skinning_weights = dict(np.load("body_models/misc/skinning_weights_all.npz"))
-        self.posedirs = dict(np.load("body_models/misc/posedirs_all.npz"))
-        self.J_regressor = dict(np.load("body_models/misc/J_regressors.npz"))
+        self.faces = np.load(body_models_path("misc/faces.npz"))["faces"]
+        self.skinning_weights = dict(np.load(body_models_path("misc/skinning_weights_all.npz")))
+        self.posedirs = dict(np.load(body_models_path("misc/posedirs_all.npz")))
+        self.J_regressor = dict(np.load(body_models_path("misc/J_regressors.npz")))
 
         if split == "train":
             cam_names = self.train_cams

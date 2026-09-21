@@ -365,10 +365,10 @@ def parse_args():
     # PARE backend options (only used when --estimator pare). Defaults point at
     # the weights downloaded under the vendored submodule (submodules/PARE).
     p.add_argument("--pare-ckpt", type=str,
-                   default="submodules/PARE/data/pare/checkpoints/pare_w_3dpw_checkpoint.ckpt",
+                   default=os.path.join(_ROOT, "submodules/PARE/data/pare/checkpoints/pare_w_3dpw_checkpoint.ckpt"),
                    help="PARE checkpoint (.ckpt). Only used with --estimator pare.")
     p.add_argument("--pare-cfg", type=str,
-                   default="submodules/PARE/data/pare/checkpoints/pare_w_3dpw_config.yaml",
+                   default=os.path.join(_ROOT, "submodules/PARE/data/pare/checkpoints/pare_w_3dpw_config.yaml"),
                    help="PARE model config (.yaml). Only used with --estimator pare.")
     p.add_argument("--pare-crop-size", type=int, default=224,
                    help="PARE input crop size (default 224).")
@@ -380,10 +380,10 @@ def parse_args():
     # swap to an HRNet-W48 config/ckpt for max accuracy at lower FPS). Files live
     # under the vendored submodule (submodules/HybrIK).
     p.add_argument("--hybrik-ckpt", type=str,
-                   default="submodules/HybrIK/pretrained_models/hybrik_res34.pth",
+                   default=os.path.join(_ROOT, "submodules/HybrIK/pretrained_models/hybrik_res34.pth"),
                    help="HybrIK checkpoint (.pth). Only used with --estimator hybrik.")
     p.add_argument("--hybrik-cfg", type=str,
-                   default="submodules/HybrIK/configs/256x192_adam_lr1e-3-res34_smpl_3d_cam_2x_mix_w_pw3d.yaml",
+                   default=os.path.join(_ROOT, "submodules/HybrIK/configs/256x192_adam_lr1e-3-res34_smpl_3d_cam_2x_mix_w_pw3d.yaml"),
                    help="HybrIK model config (.yaml). Only used with --estimator hybrik. "
                         "Must match the checkpoint (default = the ResNet-34 w/ 3DPW cfg).")
     p.add_argument("--load-ckpt", type=str, required=True,

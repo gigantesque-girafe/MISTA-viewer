@@ -6,14 +6,11 @@
 	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
 [submodule "submodules/sibr-core"]
 	path = submodules/sibr-core
-	url = https://github.com/giangvtr/sibr-core.git
+	url = git@github.com:giangvtr/sibr-core.git
 	branch = win11-rtx1080
 [submodule "submodules/sibr-flat"]
 	path = submodules/sibr-flat
 	url = https://gitlab.inria.fr/sibr/sibr_core.git
-[submodule "submodules/submodules/PARE"]
-	path = submodules/submodules/PARE
-	url = https://github.com/mkocabas/PARE.git
 [submodule "submodules/PARE"]
 	path = submodules/PARE
 	url = https://github.com/mkocabas/PARE.git

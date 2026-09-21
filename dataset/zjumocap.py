@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import sys
 import glob
@@ -23,7 +24,7 @@ class ZJUMoCapDataset(Dataset):
         self.root_dir = cfg.root_dir
         self.refine = cfg.refine
         if self.refine:
-            self.root_dir = "../../data/refined_ZJUMoCap_arah_format"
+            self.root_dir = os.path.join(os.environ.get("MISTA_DATA_ROOT", "../../data"), "refined_ZJUMoCap_arah_format")
 
         self.subject = cfg.subject
         self.train_frames = cfg.train_frames
@@ -34,10 +35,10 @@ class ZJUMoCapDataset(Dataset):
         self.H, self.W = cfg.orig_hw
         self.h, self.w = cfg.img_hw
         
-        self.faces = np.load('body_models/misc/faces.npz')['faces']
-        self.skinning_weights = dict(np.load('body_models/misc/skinning_weights_all.npz'))
-        self.posedirs = dict(np.load('body_models/misc/posedirs_all.npz'))
-        self.J_regressor = dict(np.load('body_models/misc/J_regressors.npz'))
+        self.faces = np.load(body_models_path('misc/faces.npz'))['faces']
+        self.skinning_weights = dict(np.load(body_models_path('misc/skinning_weights_all.npz')))
+        self.posedirs = dict(np.load(body_models_path('misc/posedirs_all.npz')))
+        self.J_regressor = dict(np.load(body_models_path('misc/J_regressors.npz')))
         
 
         if split == 'train':
@@ -582,8 +583,6 @@ class ZJUMoCapDataset(Dataset):
     #             print(f"    Searching for similar files...")
     #             import glob
     #             patterns = [
-    #                 "body_models/misc/*.npz",
-    #                 "/src/body_models/misc/*.npz",
     #                 "**/*uv*.npz"
     #             ]
     #             for pattern in patterns:

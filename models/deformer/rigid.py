@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -134,7 +135,7 @@ class SkinningField(RigidDeform):
         self.smpl_verts = metadata["smpl_verts"]
         self.skinning_weights = metadata["skinning_weights"]
         self.aabb = metadata["aabb"]
-        self.faces = np.load('body_models/misc/faces.npz')['faces']
+        self.faces = np.load(body_models_path('misc/faces.npz'))['faces']
         self.cano_mesh = metadata["cano_mesh"]
 
         self.distill = cfg.distill

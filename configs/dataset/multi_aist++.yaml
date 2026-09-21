@@ -22,7 +22,7 @@ defaults:
 dataset:
   name: MultiPersonZJUMoCap
   names: ['aist_d01', 'aist_d08_adv', 'aist_d09', 'aist_d11', 'aist_d12', 'aist_d13_adv', 'aist_d19', 'aist_d21_adv', 'aist_d23'] 
-  smpl_uv_npz: "/src/body_models/misc/smpl_uv_coords.npz"
+  smpl_uv_npz: "${oc.env:MISTA_BODY_MODELS,body_models}/misc/smpl_uv_coords.npz"
   
 # migs:
 #   type: tt5d

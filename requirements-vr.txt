@@ -1,0 +1,38 @@
+# MISTA real-time VR demo — Python deps (Windows, CUDA 12.8 / py3.10).
+#
+# NOTE: PyTorch must come from the CUDA 12.8 wheel index. Install it FIRST, on its
+# own, so pip doesn't pull a CPU/other-CUDA build:
+#
+#   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+#       --index-url https://download.pytorch.org/whl/cu128
+#
+# then:  pip install -r requirements-vr.txt
+#
+# The CUDA submodules (diff-gaussian-rasterization, simple-knn) and tiny-cuda-nn are
+# built by scripts/setup_windows.ps1 (they need the MSVC toolchain + --no-build-isolation)
+# and are intentionally NOT listed here.
+
+# --- core rendering / config ---
+hydra-core==1.3.2
+omegaconf==2.3.0
+plyfile==0.8.1
+tqdm
+numpy
+opencv-python==4.8.1.78
+joblib
+imageio==2.31.2
+scikit-image==0.19.3
+trimesh==3.23.5
+libigl==2.4.1
+lpips==0.1.4
+wandb==0.15.11
+
+# --- monocular pose estimators (motion-drive path) ---
+romp
+bev
+easydict
+pycocotools
+
+# --- TensorRT / ONNX acceleration (ROMP/BEV FP16 engines) ---
+onnxruntime-gpu
+onnx

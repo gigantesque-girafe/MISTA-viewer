@@ -1,0 +1,24 @@
+# MISTA real-time VR demo — reproducible conda base (Windows + NVIDIA, CUDA 12.x).
+#
+# This creates the env and the CUDA build toolkit; scripts/setup_windows.ps1 then
+# installs the cu128 torch wheels, the requirements below, and builds the CUDA
+# submodules + tiny-cuda-nn (which need the MSVC toolchain). Prefer running the
+# script — it sequences those steps and sets the required env vars.
+#
+#   conda env create -f environment-vr.yml
+#   conda activate mista
+#   powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1
+name: mista
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  # CUDA toolkit for building the submodules; keep <= your driver's CUDA.
+  - cuda-toolkit=12.4
+  - pip:
+      # torch cu128 wheels are installed separately by setup_windows.ps1
+      # (see requirements-vr.txt header), then:
+      - -r requirements-vr.txt

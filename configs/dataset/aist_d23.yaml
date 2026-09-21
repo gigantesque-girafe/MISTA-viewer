@@ -4,7 +4,7 @@ dataset_name: aist_d26
 
 dataset:
   name: zjumocap
-  root_dir: "/data/"
+  root_dir: "${oc.env:MISTA_DATA_ROOT}/"
   subject: d26/gWA_sBM_cAll_mWA0_ch01
   refine: false
 

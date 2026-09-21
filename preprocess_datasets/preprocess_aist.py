@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import shutil
 import json
@@ -11,7 +12,7 @@ from human_body_prior.body_model.body_model import BodyModel
 
 parser = argparse.ArgumentParser('Preprocessing of AIST++.')
 # Information for AIST++. This is for extracting unseen pose vectors
-parser.add_argument('--data-dir', type=str, default='/home/sfwang/Datasets/AIST++', help='Directory that contains all AIST++ .pkl data.')
+parser.add_argument('--data-dir', type=str, default=os.environ.get('MISTA_DATA_ROOT'), help='Directory that contains all AIST++ .pkl data.')
 parser.add_argument('--out-dir', type=str, default='data/odp', help='Directory where preprocessed data is saved.')
 parser.add_argument('--seqname', type=str, default='gBR_sBM_cAll_d04_mBR1_ch05', help='Sequence to process.')
 # Information for input dataset. This is for extracting body shape and camera parameters of the trained model
@@ -30,7 +31,7 @@ if __name__ == '__main__':
 
     additional_R = Rotation.from_euler('xyz', [np.pi, 0, 0]).as_matrix().astype(np.float32) # neccesary to align SMPL with image
 
-    body_model = BodyModel(bm_path='body_models/smpl/neutral/model.pkl', num_betas=10, batch_size=1).cuda()
+    body_model = BodyModel(bm_path=body_models_path('smpl/neutral/model.pkl'), num_betas=10, batch_size=1).cuda()
 
     with open('{}/{}/cam_params.json'.format(args.in_dataset, args.subject), 'r') as f:
         cameras = json.load(f)

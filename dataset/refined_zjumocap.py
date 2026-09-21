@@ -1,3 +1,4 @@
+from utils.paths import body_models_path
 import os
 import sys
 import glob
@@ -20,7 +21,7 @@ class RefinedZJUMoCapDataset(Dataset):
         self.cfg = cfg
         self.split = split
 
-        self.root_dir = '../../data/refined_ZJUMoCap/zju-mocap/'
+        self.root_dir = os.path.join(os.environ.get('MISTA_DATA_ROOT', '../../data'), 'refined_ZJUMoCap', 'zju-mocap')
         self.subject = 'my_' + cfg.subject[-3:]
         self.train_frames = cfg.train_frames
         self.train_cams = cfg.train_views
@@ -35,10 +36,10 @@ class RefinedZJUMoCapDataset(Dataset):
         self.cameras = annots['cams']
         num_cams = len(self.cameras['K'])
 
-        self.faces = np.load('body_models/misc/faces.npz')['faces']
-        self.skinning_weights = dict(np.load('body_models/misc/skinning_weights_all.npz'))
-        self.posedirs = dict(np.load('body_models/misc/posedirs_all.npz'))
-        self.J_regressor = dict(np.load('body_models/misc/J_regressors.npz'))
+        self.faces = np.load(body_models_path('misc/faces.npz'))['faces']
+        self.skinning_weights = dict(np.load(body_models_path('misc/skinning_weights_all.npz')))
+        self.posedirs = dict(np.load(body_models_path('misc/posedirs_all.npz')))
+        self.J_regressor = dict(np.load(body_models_path('misc/J_regressors.npz')))
 
         if split == 'train':
             cam_names = self.train_cams

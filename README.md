@@ -88,11 +88,11 @@ configs/dataset/
 Before training, modify the following variables inside the provided SLURM script:
 
 ```bash
-SIF=/path/to/your/singularity_image.sif
+SIF=${MISTA_SIF}
 
-BIND_DATA=/path/to/your/dataset:/data/
+BIND_DATA=${MISTA_DATA_ROOT}:/data/
 
-BIND_SRC=/path/to/your/source_code:/src/
+BIND_SRC=${MISTA_ROOT}:/src/
 
 WANDB_API_KEY=<your_wandb_key>
 ```
@@ -138,7 +138,7 @@ migs.type=cp
 python render.py mode=test
 
 # On my Windows
-python render.py mode=test wandb_disable=True appearance_identity=2 load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth"
+python render.py mode=test wandb_disable=True appearance_identity=2 load_ckpt="%MISTA_CKPT%"
 
 ```
 
@@ -153,7 +153,7 @@ opt.iterations=50000 \
 migs.type=tt5d \
 migs.use_mars=false \
 appearance_identity=0 // 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
-load_ckpt=/path/to/ckpt50000.pth
+load_ckpt=%MISTA_CKPT%
 ```
 
 ### Novel Pose Synthesis
@@ -166,10 +166,10 @@ migs.type=tt5d \
 migs.use_mars=false \
 dataset.predict_seq= 0 // 0,1,2,3, to try differnt dances
 appearance_identity=0 // 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
-load_ckpt=/path/to/ckpt50000.pth
+load_ckpt=%MISTA_CKPT%
 
 #on my rtx1080
-python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
+python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
 ```
 
 ---
@@ -250,9 +250,50 @@ We sincerely thank the authors of these works for making their research and reso
 
 ---
 ## Run VR Application
+
+> **Architecture note.** This is a **PC-VR** demo, not a standalone Quest app. A Python
+> process (pose estimation → MISTA Gaussian deform) hands GPU memory to a native C++
+> SIBR OpenXR viewer over **CUDA-IPC** (same machine, same GPU); the viewer renders to
+> the headset through **Meta Quest Link's Windows OpenXR runtime**. It therefore runs on
+> **Windows + NVIDIA only** — it cannot be shipped to the Meta Store or run from a Linux
+> container.
+
+### Quick start (portable demo kit)
+
+1. Install the admin-level prereqs once: NVIDIA driver + **CUDA Toolkit 12.8**, **VS 2019
+   Build Tools** + **VS Community 2022**, **Miniconda**, **git**, and **Meta Quest Link**.
+2. Build the Python environment (automates the whole recipe below):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+   ```
+3. Configure paths — copy `.env.example` to `.env` and edit it (see **Path configuration**).
+4. Download weights: `powershell -ExecutionPolicy Bypass -File scripts\fetch_assets.ps1`
+   (then place SMPL models and run `python extract_smpl_parameters.py` as instructed).
+5. Launch producer + viewer together:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\run_demo.ps1 -Identity 2          # VR
+   powershell -ExecutionPolicy Bypass -File scripts\run_demo.ps1 -Desktop             # desktop mirror
+   ```
+
+### Path configuration
+
+All machine-specific paths are read from environment variables — **no source edits needed**.
+Copy `.env.example` to `.env` and set:
+
+| Variable | Meaning |
+| --- | --- |
+| `MISTA_ROOT` | repo root (auto-detected if unset) |
+| `MISTA_DATA_ROOT` | dataset root (ZJU / AIST / Neuman / PeopleSnapshot) |
+| `MISTA_BODY_MODELS` | SMPL body-model dir (default `<MISTA_ROOT>/body_models`) |
+| `MISTA_CKPT` | trained avatar checkpoint (`.pth`) used by the examples below |
+
+Hydra configs resolve the same vars via `${oc.env:VAR}`. In the example commands below,
+`%MISTA_CKPT%` / `%MISTA_DATA_ROOT%` are those environment variables (cmd.exe syntax; use
+`$env:MISTA_CKPT` in PowerShell).
+
 ### Setup the headset
 - Open Meta Horizon Link software, then goes into Settings > General > Set Meta Link as default OpenXR. You may need administrator right for this
-- 
+-
 
 
 ## Setup the PC
@@ -260,29 +301,29 @@ We sincerely thank the authors of these works for making their research and reso
 
 Predict new pose mode
 ```shell
-call "C:\Users\travu\AppData\Local\miniconda3\Scripts\activate.bat" "C:\Users\travu\AppData\Local\miniconda3"
+call "%USERPROFILE%\miniconda3\Scripts\activate.bat" "%USERPROFILE%\miniconda3"   REM adjust to your Miniconda install
 
-conda activate 3dgs-avatar
+conda activate mista
 
 set KMP_DUPLICATE_LIB_OK=TRUE
 
 # Original render file
-python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="C:/Users/travu/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
+python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
 
 # fixed identity
-python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth"
+python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%"
 
 # realtime multi-identity change - MISTA
-python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=0 +start_identity=0 load_ckpt=H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth
+python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=0 +start_identity=0 load_ckpt=%MISTA_CKPT%
 
-python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d_color_split migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt="C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth"
+python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d_color_split migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt="%MISTA_CKPT%"
 
 # realtime multi-identity change - MIGS
-python render_v1_modular_multiviewer.py mode=predict dataset=migs migs.type=cp migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt=C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth
+python render_v1_modular_multiviewer.py mode=predict dataset=migs migs.type=cp migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt=%MISTA_CKPT%
 
 # test motion transfer
 
-python render.py mode=predict dataset=migs_multi_zju_5d_mars dataset.predict_seq=2 migs.use_mars=false opt.iterations=50000 appearance_identity=5 load_ckpt="C:/Users/travu/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" wandb_disable=True
+python render.py mode=predict dataset=migs_multi_zju_5d_mars dataset.predict_seq=2 migs.use_mars=false opt.iterations=50000 appearance_identity=5 load_ckpt="%MISTA_CKPT%" wandb_disable=True
 
 ```
 
@@ -293,7 +334,7 @@ python render_vr_v1.py mode=test dataset=migs_multi_zju_5d_mars migs.type=tt5d m
 
 
 # Run migs
-python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" wandb_disable=True
+python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
 
 ```
 
@@ -335,24 +376,24 @@ Both tiles share one camera: drag inside either one and both viewpoints move tog
 (same controls as the single-tile table above).
 ```shell
 # Low resolution
-& "C:\Users\travu\MISTA\submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
+& "submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
 
 # high resolution
-& "C:\Users\travu\MISTA\submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
+& "submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
 
 #Terminal 1 — TT5D
-python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" +gaussians_vr.port=6012
+python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +gaussians_vr.port=6012
 
 #Terminal 2 — CP-R100
-python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" wandb_disable=True +gaussians_vr.port=6013
+python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True +gaussians_vr.port=6013
 ```
 
 ### Running full pipeline in Python
 ```shell
 # terminal 1 (migs)
-python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="C:\Users\travu\dataMISTA\MIGS_R100\exp_cp_8p_100r\migs_multi_zju-none-mlp_field-ingp-shallow_mlp-default\ckpt50000.pth" +desktopv1.port=6009 +desktopv1.hold=0
+python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +desktopv1.port=6009 +desktopv1.hold=0
 # terminal 1 (mista)
-python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs_multi_zju_5d_mars migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" +desktopv1.port=6009 +desktopv1.hold=0
+python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs_multi_zju_5d_mars migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +desktopv1.port=6009 +desktopv1.hold=0
 
 # Terminal 2
 submodules\sibr-core\install\bin\SIBR_remoteGaussian_app_rwdi.exe --ip 127.0.0.1 --port 6009 -s data\dummy_viewer
@@ -360,24 +401,24 @@ submodules\sibr-core\install\bin\SIBR_remoteGaussian_app_rwdi.exe --ip 127.0.0.1
 
 
 ### ROMP wiring with OpenCV visualization
-python motion-driven-render.py --source video --video C:/Users/travu/Downloads/taichi.mp4 --identity 3 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --output out.mp4
+python motion-driven-render.py --source video --video %MISTA_DATA_ROOT%/taichi.mp4 --identity 3 --load-ckpt "%MISTA_CKPT%" --output out.mp4
 
 ```shell
 #with filter: avatar upside down
-python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 2 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --port 6012
+python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012
 
 # no filter
-python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 2 --load-ckpt "H:/dataMISTA/MISTA/TrainScratch_TT5D_8p_ratio_05/migs_multi_zju-none-mlp_field-ingp-shallow_mlp-ratio05/ckpt50000.pth" --port 6012 --no-smooth
+python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012 --no-smooth
 
 # same desktop viewer
 
 
 # with color split model
-python motion-drive-render-v43.py --source video --video C:/Users/travu/Downloads/taichi-cut.mp4 --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --port 6012 --romp-every-n 2
+python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 3 --load-ckpt "%MISTA_CKPT%" --port 6012 --romp-every-n 2
 
 
 # with different estimator
-python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp
+python motion-drive-render-v43.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator romp
 
 # HybrIK estimator (higher accuracy than ROMP/PARE, slower; defaults to the ResNet-34
 # backbone + full-frame crop to stay usable on the RTX 1080).
@@ -390,6 +431,6 @@ python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMIS
 #   3) ResNet-34 checkpoint (Google Drive id 19ktHbERz0Un5EzJYZBdzdzTrFyd9gLCx) ->
 #      submodules/HybrIK/pretrained_models/hybrik_res34.pth
 # Config paired with that checkpoint: 256x192_adam_lr1e-3-res34_smpl_3d_cam_2x_mix_w_pw3d.yaml
-python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator hybrik
+python motion-drive-render-v43.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator hybrik
 
 ```
