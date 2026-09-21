@@ -298,48 +298,107 @@ Hydra configs resolve the same vars via `${oc.env:VAR}`. In the example commands
 
 ## Setup the PC
 
+There are two entry points for the interactive viewer:
 
-Predict new pose mode
+* **`render_vr.py`** — plays back a *pre-recorded* ZJU/AIST pose sequence (Hydra-based)
+  and streams the deformed Gaussians to the SIBR viewer (VR or desktop mirror).
+* **`render_webcam.py`** — drives the avatar *live* from a **video file or webcam** using
+  a pose estimator (ROMP / BEV / PARE / HybrIK), then streams to the same SIBR viewer.
+
+First activate the environment (once per terminal):
+
 ```shell
 call "%USERPROFILE%\miniconda3\Scripts\activate.bat" "%USERPROFILE%\miniconda3"   REM adjust to your Miniconda install
-
 conda activate mista
-
 set KMP_DUPLICATE_LIB_OK=TRUE
-
-# Original render file
-python render.py mode=predict dataset=migs_multi_zju_5d_mars opt.iterations=50000 migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
-
-# fixed identity
-python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%"
-
-# realtime multi-identity change - MISTA
-python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=0 +start_identity=0 load_ckpt=%MISTA_CKPT%
-
-python render_v1_modular_multiviewer.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d_color_split migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt="%MISTA_CKPT%"
-
-# realtime multi-identity change - MIGS
-python render_v1_modular_multiviewer.py mode=predict dataset=migs migs.type=cp migs.use_mars=false dataset.predict_seq=0 wandb_disable=True +drive_identity=2 +start_identity=2 load_ckpt=%MISTA_CKPT%
-
-# test motion transfer
-
-python render.py mode=predict dataset=migs_multi_zju_5d_mars dataset.predict_seq=2 migs.use_mars=false opt.iterations=50000 appearance_identity=5 load_ckpt="%MISTA_CKPT%" wandb_disable=True
-
 ```
 
-Test view
+### `render_vr.py` — pre-recorded sequence playback
+
+General formula:
+
 ```shell
-python render_vr_v1.py mode=test dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="./results/zju_377_mono/ckpt50000_MISTA.pth"
-
-
-
-# Run migs
-python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
-
+python render_vr.py mode=predict \
+  dataset=<DATASET> migs.type=<TYPE> migs.use_mars=false \
+  dataset.predict_seq=<SEQ> appearance_identity=<ID> \
+  load_ckpt="<CKPT>" wandb_disable=True [+gaussians_vr.port=<PORT>]
 ```
+
+Working examples (from my machine — adjust the checkpoint):
+
+```shell
+# MISTA (Tensor Train), identity 2, first dance sequence
+python render_vr.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%"
+
+# MIGS (CP decomposition)
+python render_vr.py mode=predict dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True
+```
+
+Key Hydra overrides:
+
+| Override | Choices / example | Meaning |
+| --- | --- | --- |
+| `mode` | `predict` / `test` | `predict` = novel-pose playback; `test` = eval view |
+| `dataset` | `migs_multi_zju_5d_mars`, `migs` | dataset/config group; `migs` for CP checkpoints |
+| `migs.type` | `tt5d`, `tt5d_color_split`, `cp` | representation (TT for MISTA, `cp` for MIGS) |
+| `migs.use_mars` | `false` / `true` | adaptive-rank (MISTA-AR) variant |
+| `dataset.predict_seq` | `0,1,2,3` | which motion/dance sequence to play back |
+| `appearance_identity` | `0`–`7` | which learned identity to render (see note below) |
+| `load_ckpt` | path to `.pth` | trained avatar checkpoint |
+| `wandb_disable` | `True` | skip Weights & Biases logging |
+| `+gaussians_vr.port` | `6012` (default) | TCP port the SIBR viewer connects to |
+
+### `render_webcam.py` — live video / webcam drive
+
+General formula:
+
+```shell
+python render_webcam.py --source <video|webcam> [--video <PATH> | --camera-index <N>] \
+  --identity <ID> --load-ckpt "<CKPT>" --estimator <romp|bev|pare|hybrik> \
+  --port <PORT> [--trt --trt-fp16 --trt-lib-dir "<TensorRT lib>"] [flags...]
+```
+
+Working examples (from my machine — adjust the checkpoint):
+
+```shell
+# video file, ROMP estimator (default smoothing on)
+python render_webcam.py --source video --video "%MISTA_DATA_ROOT%/taichi-cut.mp4" --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012
+
+# raw pose, no One-Euro smoothing
+python render_webcam.py --source video --video "%MISTA_DATA_ROOT%/taichi-cut.mp4" --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012 --no-smooth
+
+# run ROMP every 2nd frame (cheaper) with a color-split model
+python render_webcam.py --source video --video "%MISTA_DATA_ROOT%/taichi-cut.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --port 6012 --romp-every-n 2
+
+# TensorRT (FP16) + root motion, identity 3
+python render_webcam.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator romp --trt --trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --root-motion --root-scale 1.0
+
+# live webcam
+python render_webcam.py --source webcam --camera-index 0 --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator romp --trt --no-trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --realtime off
+```
+
+Key CLI flags (see `python render_webcam.py --help` for the full list, incl. head-pose and retarget options):
+
+| Flag | Choices / default | Meaning |
+| --- | --- | --- |
+| `--source` | `webcam` / `video` | live camera or a video file |
+| `--video` | path | input video (with `--source video`) |
+| `--camera-index` | `0` | webcam index (with `--source webcam`) |
+| `--identity` | `0`–`7` | target MISTA identity (see note below) |
+| `--load-ckpt` | path (required) | MISTA 8-identity checkpoint `.pth` |
+| `--estimator` | `romp` / `bev` / `pare` / `hybrik` | pose-estimation backend |
+| `--port` | `6012` | TCP port the SIBR viewer connects to |
+| `--romp-every-n` | `1` | run the estimator every N frames, reuse in between |
+| `--trt` / `--no-trt` | off | ROMP via TensorRT EP vs plain CUDA |
+| `--trt-fp16` / `--no-trt-fp16` | on | TensorRT FP16 (faster) vs FP32 (safer) |
+| `--trt-lib-dir` | path | TensorRT 8.6 `lib` folder |
+| `--smooth` / `--no-smooth` | on | One-Euro pose smoothing |
+| `--realtime` | `auto` / `on` / `off` | drop stale frames to keep a live source realtime |
+| `--root-motion` | off | apply root translation from the source |
+| `--no-window` | off | stream to the C++ viewer only (no source-frame window) |
 
 Note:
-- Apparance identity: 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
+- Appearance / identity index: 0:386, 1:387, 2:377, 3:392, 4:315, 5:394, 6:393, 7:390
 
 In second terminal: OpenXR Application for VR Viewer
 ```shell
@@ -382,56 +441,8 @@ Both tiles share one camera: drag inside either one and both viewpoints move tog
 & "submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
 
 #Terminal 1 — TT5D
-python render_vr_v1_modular.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +gaussians_vr.port=6012
+python render_vr.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +gaussians_vr.port=6012
 
 #Terminal 2 — CP-R100
-python render_vr_v1_modular.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True +gaussians_vr.port=6013
-```
-
-### Running full pipeline in Python
-```shell
-# terminal 1 (migs)
-python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +desktopv1.port=6009 +desktopv1.hold=0
-# terminal 1 (mista)
-python render_desktop_v1.py mode=predict dataset.predict_seq=0 dataset=migs_multi_zju_5d_mars migs.type=cp migs.use_mars=false appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +desktopv1.port=6009 +desktopv1.hold=0
-
-# Terminal 2
-submodules\sibr-core\install\bin\SIBR_remoteGaussian_app_rwdi.exe --ip 127.0.0.1 --port 6009 -s data\dummy_viewer
-```
-
-
-### ROMP wiring with OpenCV visualization
-python motion-driven-render.py --source video --video %MISTA_DATA_ROOT%/taichi.mp4 --identity 3 --load-ckpt "%MISTA_CKPT%" --output out.mp4
-
-```shell
-#with filter: avatar upside down
-python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012
-
-# no filter
-python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 2 --load-ckpt "%MISTA_CKPT%" --port 6012 --no-smooth
-
-# same desktop viewer
-
-
-# with color split model
-python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taichi-cut.mp4 --identity 3 --load-ckpt "%MISTA_CKPT%" --port 6012 --romp-every-n 2
-
-
-# with different estimator
-python motion-drive-render-v43.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator romp
-
-# root pinning
-python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --root-motion --root-scale 1.0
-
-# motion retargetting
-python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --root-motion --root-scale 1.0 --retarget
-
-python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\baby2.mp4" --identity 3 --load-ckpt "C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth" --estimator romp --retarget --retarget-mode principled --limb-scale 1.0 --no-ground --root-motion --trt --trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib"
-
-# to run overlay version 
-set MISTA_PROFILE=1 && python motion-drive-composite.py --video "C:\Users\travu\dataMISTA\video\baby2.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --retarget --retarget-mode principled --no-ground --out scratchpad/overlay-retarget-baby2-4.mp4
-
-# run online webcam
-python motion-drive-render-v43.py --source webcam --camera-index 0 --identity 3 --load-ckpt "C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --realtime off
-
+python render_vr.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True +gaussians_vr.port=6013
 ```
