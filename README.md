@@ -420,17 +420,18 @@ python motion-drive-render-v43.py --source video --video %MISTA_DATA_ROOT%/taich
 # with different estimator
 python motion-drive-render-v43.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator romp
 
-# HybrIK estimator (higher accuracy than ROMP/PARE, slower; defaults to the ResNet-34
-# backbone + full-frame crop to stay usable on the RTX 1080).
-# One-time setup (submodules/HybrIK is `git clone https://github.com/Jeff-sjtu/HybrIK`):
-#   pip install easydict pycocotools        # deps (pytorch3d NOT needed: bundled shim)
-#   1) HybrIK model_files.zip (Google Drive id 1un9yAGlGjDooPwlnwFpJrbGHRiLaBNzV),
-#      unzip -> submodules/HybrIK/model_files/  (J_regressor_h36m.npy, h36m_mean_beta.npy, ...)
-#   2) SMPL neutral model from https://smplify.is.tue.mpg.de (register) ->
-#      submodules/HybrIK/model_files/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl
-#   3) ResNet-34 checkpoint (Google Drive id 19ktHbERz0Un5EzJYZBdzdzTrFyd9gLCx) ->
-#      submodules/HybrIK/pretrained_models/hybrik_res34.pth
-# Config paired with that checkpoint: 256x192_adam_lr1e-3-res34_smpl_3d_cam_2x_mix_w_pw3d.yaml
-python motion-drive-render-v43.py --source video --video "%MISTA_DATA_ROOT%\video\hiit-spider.mp4" --identity 3 --load-ckpt "%MISTA_CKPT%" --estimator hybrik
+# root pinning
+python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --root-motion --root-scale 1.0
+
+# motion retargetting
+python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\hiit-spider.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --root-motion --root-scale 1.0 --retarget
+
+python motion-drive-render-v43.py --source video --video "C:\Users\travu\dataMISTA\video\baby2.mp4" --identity 3 --load-ckpt "C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth" --estimator romp --retarget --retarget-mode principled --limb-scale 1.0 --no-ground --root-motion --trt --trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib"
+
+# to run overlay version 
+set MISTA_PROFILE=1 && python motion-drive-composite.py --video "C:\Users\travu\dataMISTA\video\baby2.mp4" --identity 3 --load-ckpt "C:/Users/travu/dataMISTA/Mista_Split_Color/Mista_Split_Color/ckpt50000.pth" --estimator romp --trt --trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --retarget --retarget-mode principled --no-ground --out scratchpad/overlay-retarget-baby2-4.mp4
+
+# run online webcam
+python motion-drive-render-v43.py --source webcam --camera-index 0 --identity 3 --load-ckpt "C:\Users\travu\dataMISTA\Mista_Split_Color\Mista_Split_Color\ckpt50000.pth" --estimator romp --trt --no-trt-fp16 --trt-lib-dir "C:\Users\travu\TensorRT\TensorRT-8.6.1.6\lib" --realtime off
 
 ```

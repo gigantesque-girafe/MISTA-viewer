@@ -117,7 +117,6 @@ from pipeline import (
 )
 from pipeline.retarget import (add_retarget_args, build_retargeter,  # optional IK retarget (--retarget)
                                source_jtr_from_betas)
-from pipeline import camera as _camera   # PnP + intrinsics for --retarget-mode reproj
 
 
 # --------------------------------------------------------------------------- #
@@ -160,28 +159,15 @@ class LiveVRSource(VRSource):
         self._romp_ctr = 0                  # drives --romp-every-n skipping
         self.window = None if args.no_window else SourceWindow(estimator.name, args, frame_source)
 
-        # Deferred principled-retarget attach: when --retarget-mode principled is
-        # requested without --source-jtr-npz, the solver is built once the actor
-        # rest skeleton is locked from the first N valid betas (see below).
-        self._defer_retarget = (adapter.retargeter is None
-                                and args.retarget
-                                and args.retarget_mode == "principled")
+        # Deferred retarget attach: when --retarget is requested without
+        # --source-jtr-npz, the solver is built once the actor rest skeleton is
+        # locked from the first N valid betas (see below).
+        self._defer_retarget = (adapter.retargeter is None and args.retarget)
         self._betas_buf = []                # accumulates estimator.last_betas until lock
-
-        # 2D-reprojection retarget (--retarget-mode reproj): per-frame PnP camera
-        # from the avatar's posed joints <-> the estimator's 2D keypoints, fed to the
-        # retargeter so it can solve the legs onto the (reliable) 2D. Seed each PnP
-        # from the previous solution and One-Euro smooth the camera (reusing the pose
-        # smoothing cutoffs) so a noisy per-frame solve doesn't jitter the target.
-        self._reproj_on = bool(args.retarget and args.retarget_mode == "reproj")
-        self._pnp_prev = (None, None)       # (rvec, tvec) seed for temporal continuity
-        self._cam_smoother = (_camera.CameraSmoother(
-            args.smooth_frequency, args.min_cutoff, args.beta)
-            if (self._reproj_on and args.smooth) else None)
 
     def _maybe_lock_source_skeleton(self):
         """Collect one valid frame's betas; once N are gathered, build source_Jtr
-        and attach the principled retarget solver. No-op unless deferred."""
+        and attach the retarget solver. No-op unless deferred."""
         if not self._defer_retarget:
             return
         betas = getattr(self.estimator, "last_betas", None)
@@ -196,42 +182,9 @@ class LiveVRSource(VRSource):
             self.args, self.adapter.Jtr_target, source_Jtr)
         self._defer_retarget = False
         self._betas_buf = []
-        print(f"[INIT] IK retarget ON (mode={self.args.retarget_mode}, "
-              f"proportion={self.args.proportion}, "
-              f"limb_scale={getattr(self.args, 'limb_scale', 1.0)}); "
+        print(f"[INIT] Retarget ON (proportion={self.args.proportion}); "
               f"source_Jtr locked from "
               f"{self.args.source_betas_frames} frames.", flush=True)
-
-    def _set_reproj_observation(self, pose, frame):
-        """reproj mode: solve a per-frame PnP camera from the avatar's posed joints
-        <-> the estimator's 2D keypoints and hand it (with the 2D targets) to the
-        retargeter. On any failure, clear the observation so reproj passes through
-        (never freezes the avatar). Mirrors motion-drive-composite.py's PnP block."""
-        rt = getattr(self.adapter, "retargeter", None)
-        if rt is None:
-            return
-        pj2d = getattr(self.estimator, "last_pj2d", None)
-        if pj2d is None:
-            rt.set_observation(None, None, None, None, None)
-            return
-        H, W = frame.shape[:2]
-        K, _f = _camera.romp_intrinsics(W, H)
-        joints3d = self.adapter.posed_joints(pose)                      # (24,3)
-        pairs = getattr(self.estimator, "pj2d_smpl_map", None) \
-            or [(i, i) for i in range(min(24, len(pj2d)))]
-        pairs = [(r, s) for (r, s) in pairs if r < len(pj2d) and s < len(joints3d)]
-        R = t = None
-        if len(pairs) >= 6:
-            obj3d = joints3d[[s for _, s in pairs]]
-            img2d = pj2d[[r for r, _ in pairs]]
-            prev_rvec, prev_tvec = self._pnp_prev
-            R, t, rt_seed = _camera.solve_pnp(obj3d, img2d, K, use_ransac=True,
-                                              prev_rvec=prev_rvec, prev_tvec=prev_tvec)
-            if R is not None:
-                self._pnp_prev = rt_seed                                # seed next solve (RAW)
-                if self._cam_smoother is not None:
-                    R, t = self._cam_smoother(R, t)
-        rt.set_observation(K, R, t, pj2d, pairs)
 
     def on_connect(self):
         self.renderer.on_connect()
@@ -278,16 +231,13 @@ class LiveVRSource(VRSource):
                 raw_pose = self.head_pose.apply(raw_pose, frame)
             pose, trans, status = self.processor.process((raw_pose, raw_trans), t0)
             if pose is not None:
-                # Lock the actor rest skeleton and attach the principled solver once
+                # Lock the actor rest skeleton and attach the retarget solver once
                 # enough betas are seen (no-op unless deferred / already attached).
                 self._maybe_lock_source_skeleton()
                 # Optional deterministic IK retarget (--retarget). No-op passthrough
                 # when disabled: pose/trans unchanged, correction is None.
                 if _PROFILE:
                     _pr = time.perf_counter()
-                # reproj mode: attach this frame's PnP camera + 2D targets first.
-                if self._reproj_on:
-                    self._set_reproj_observation(pose, frame)
                 pose, trans, correction = self.adapter.retarget(pose, trans)
                 cam = self.adapter.to_camera(pose, self.identity, trans,
                                              extra_trans=correction)
@@ -630,23 +580,20 @@ def main():
     if trans_xform is not None:
         print(f"[INIT] Root motion ON (scale={args.root_scale}, axis={args.root_axis}, "
               f"horizontal={args.root_horizontal}).")
-    # Principled proportion retarget needs the actor rest skeleton (source_Jtr).
-    # With --source-jtr-npz it is known up front; otherwise it is locked from the
-    # first N valid frames of live betas (LiveVRSource._maybe_lock_source_skeleton),
-    # so the solver is attached lazily and the pose path is unchanged until then.
+    # Proportion retarget needs the actor rest skeleton (source_Jtr). With
+    # --source-jtr-npz it is known up front; otherwise it is locked from the first
+    # N valid frames of live betas (LiveVRSource._maybe_lock_source_skeleton), so
+    # the solver is attached lazily and the pose path is unchanged until then.
     source_Jtr = None
-    principled = args.retarget and args.retarget_mode == "principled"
-    if principled and args.source_jtr_npz:
+    if args.retarget and args.source_jtr_npz:
         source_Jtr = np.asarray(np.load(args.source_jtr_npz)["Jtr"], dtype=np.float64)
         print(f"[INIT] Loaded source_Jtr from {args.source_jtr_npz}.")
-    defer_retarget = principled and source_Jtr is None
+    defer_retarget = args.retarget and source_Jtr is None
     retargeter = None if defer_retarget else build_retargeter(args, Jtr_target, source_Jtr)
     if retargeter is not None:
-        print(f"[INIT] IK retarget ON (mode={args.retarget_mode}, "
-              f"proportion={args.proportion}, "
-              f"limb_scale={getattr(args, 'limb_scale', 1.0)}).")
+        print(f"[INIT] Retarget ON (proportion={args.proportion}).")
     elif defer_retarget:
-        print(f"[INIT] IK retarget (principled) pending: locking actor betas over "
+        print(f"[INIT] Retarget pending: locking actor betas over "
               f"the first {args.source_betas_frames} valid frames ...")
     adapter = MistaPoseAdapter(template_cam, Jtr_target, b02v_inv, renderer.device,
                                trans_xform=trans_xform, retargeter=retargeter)

@@ -15,6 +15,7 @@ be installed.
 
 import os
 import sys
+import time
 from abc import ABC, abstractmethod
 
 import cv2
@@ -24,6 +25,79 @@ import torch
 # Repo root (parent of this `pipeline/` package) — used to locate the vendored
 # PARE / HybrIK submodules and to keep their relative resource paths resolvable.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class _StageProfiler:
+    """Opt-in per-stage timer for estimate(), enabled by MISTA_PROFILE=1.
+
+    Purpose: settle whether mesh generation or the CNN backbone dominates a
+    backend's frame time. Each estimate() brackets its phases (preprocess /
+    forward / post) with `with prof.stage("forward"): ...`; we CUDA-synchronize
+    around each so GPU async work is attributed to the right phase rather than
+    bleeding into the next. A rolling mean (ms) per stage prints every
+    `report_every` frames. Disabled (the default) it is a no-op: stage() yields
+    immediately and adds no sync, so normal runs are unaffected.
+    """
+
+    _enabled = os.environ.get("MISTA_PROFILE", "") not in ("", "0", "false", "False")
+
+    def __init__(self, label, report_every=60):
+        self._label = label
+        self._every = int(os.environ.get("MISTA_PROFILE_EVERY", report_every))
+        self._sums = {}
+        self._n = 0
+        self._order = []
+        self._cuda = torch.cuda.is_available()
+
+    def _sync(self):
+        if self._cuda:
+            torch.cuda.synchronize()
+
+    class _Timer:
+        def __init__(self, prof, name):
+            self._p, self._name = prof, name
+
+        def __enter__(self):
+            self._p._sync()
+            self._t = time.perf_counter()
+            return self
+
+        def __exit__(self, *exc):
+            self._p._sync()
+            dt = (time.perf_counter() - self._t) * 1000.0
+            p = self._p
+            if self._name not in p._sums:
+                p._sums[self._name] = 0.0
+                p._order.append(self._name)
+            p._sums[self._name] += dt
+            return False
+
+    def stage(self, name):
+        if not _StageProfiler._enabled:
+            return _NULL_CTX
+        return self._Timer(self, name)
+
+    def tick(self):
+        """Call once per processed frame; prints a rolling mean every N frames."""
+        if not _StageProfiler._enabled:
+            return
+        self._n += 1
+        if self._n % self._every == 0:
+            parts = [f"{k}={self._sums[k] / self._n:.2f}ms" for k in self._order]
+            total = sum(self._sums.values()) / self._n
+            print(f"[PROFILE:{self._label}] n={self._n} " + " ".join(parts)
+                  + f" total={total:.2f}ms")
+
+
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NULL_CTX = _NullCtx()
 
 
 def _root_fix_matrix(spec):
@@ -107,33 +181,134 @@ class RompEstimator(PoseEstimator):
         # (pj2d_row, smpl_joint) correspondences for PnP alignment; see PJ2D_SMPL_MAP.
         self.pj2d_smpl_map = self.PJ2D_SMPL_MAP
         # Latest person's SMPL betas ((10,) float32) or None. ROMP returns these
-        # under `smpl_betas` when built with --calc_smpl (see _build_romp_model).
+        # under `smpl_betas` when built with --calc_smpl (see from_args).
         self.last_betas = None
+        self._prof = _StageProfiler(self._name)
 
     @property
     def name(self):
         return self._name
 
     def estimate(self, frame_bgr):
-        with torch.no_grad():
-            out = self._model(frame_bgr)
-        if out is not None and out.get("smpl_thetas", None) is not None \
-                and len(out["smpl_thetas"]) > 0:
-            thetas = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
-            trans = None
-            ct = out.get("cam_trans", None)
-            if ct is not None and len(ct) > 0:
-                trans = np.asarray(ct[0], dtype=np.float32).reshape(-1)
-            pj = out.get("pj2d_org", None)
-            self.last_pj2d = (np.asarray(pj[0], dtype=np.float32)
-                              if pj is not None and len(pj) > 0 else None)
-            bt = out.get("smpl_betas", None)
-            self.last_betas = (np.asarray(bt[0], dtype=np.float32).reshape(-1)
-                               if bt is not None and len(bt) > 0 else None)
-            return thetas, trans
-        self.last_pj2d = None
-        self.last_betas = None
-        return None, None
+        with self._prof.stage("forward"):
+            with torch.no_grad():
+                out = self._model(frame_bgr)
+        with self._prof.stage("post"):
+            if out is not None and out.get("smpl_thetas", None) is not None \
+                    and len(out["smpl_thetas"]) > 0:
+                thetas = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
+                trans = None
+                ct = out.get("cam_trans", None)
+                if ct is not None and len(ct) > 0:
+                    trans = np.asarray(ct[0], dtype=np.float32).reshape(-1)
+                pj = out.get("pj2d_org", None)
+                self.last_pj2d = (np.asarray(pj[0], dtype=np.float32)
+                                  if pj is not None and len(pj) > 0 else None)
+                bt = out.get("smpl_betas", None)
+                self.last_betas = (np.asarray(bt[0], dtype=np.float32).reshape(-1)
+                                   if bt is not None and len(bt) > 0 else None)
+                result = (thetas, trans)
+            else:
+                self.last_pj2d = None
+                self.last_betas = None
+                result = (None, None)
+        self._prof.tick()
+        return result
+
+    @classmethod
+    def from_args(cls, args):
+        """Construct a RompEstimator with the ONNX/CUDA/TensorRT backend selected by args.
+
+        ONNX-GPU is ROMP's real-time path; TensorRT (--trt) routes that SAME ONNX
+        graph through onnxruntime's TensorRT execution provider for a clean A/B. We
+        set the providers EXPLICITLY after construction (ROMP hardcodes
+        [TRT, CUDA, CPU] in romp/main.py) so the non-TRT baseline is pure CUDA and
+        the TRT path carries FP16 + a persistent engine cache. We never fall back to
+        the CPU-ONNX provider (slower than ROMP's PyTorch backbone).
+        """
+        import romp  # lazy: only needed for the ROMP backend
+
+        use_onnx = args.onnx
+        use_trt = bool(getattr(args, "trt", False))
+
+        # Put TensorRT's (and cuDNN's) DLLs on PATH BEFORE onnxruntime is imported.
+        # onnxruntime's TensorRT provider (onnxruntime_providers_tensorrt.dll) resolves
+        # its dependencies (nvinfer*.dll + cuDNN) via the process PATH -- NOT via
+        # os.add_dll_directory -- so a missing entry surfaces as LoadLibrary error 126.
+        # cuDNN 8 ships inside torch/lib; ORT 1.15.x's TRT EP is happy with it (1.16.x
+        # wants cuDNN 8.9 and clashes with torch's 8.7). Must run before `import
+        # onnxruntime` so the provider sees the augmented PATH.
+        if use_trt:
+            _prepend_trt_dll_path(getattr(args, "trt_lib_dir", None))
+
+        ort = None
+        if use_onnx:
+            try:
+                import onnxruntime as ort
+            except ImportError:
+                print("[INIT] onnxruntime not installed; "
+                      "falling back to ROMP PyTorch backend.")
+                use_onnx = use_trt = False
+        if use_onnx:
+            available = ort.get_available_providers()
+            if use_trt and "TensorrtExecutionProvider" not in available:
+                print("[INIT] onnxruntime has no TensorrtExecutionProvider; "
+                      "falling back to the CUDA ONNX backend.")
+                use_trt = False
+            if "CUDAExecutionProvider" not in available:
+                print("[INIT] onnxruntime has no CUDAExecutionProvider; "
+                      "falling back to ROMP PyTorch backend.")
+                use_onnx = use_trt = False
+
+        # Pre-seed the TensorRT EP env options BEFORE constructing ROMP, so the
+        # session ROMP builds internally (its hardcoded [TRT, CUDA, CPU] list) shares
+        # the same engine/timing cache we reuse below -- no wasted first engine build.
+        if use_trt:
+            os.makedirs(args.trt_cache_dir, exist_ok=True)
+            os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1" if args.trt_fp16 else "0"
+            os.environ["ORT_TENSORRT_ENGINE_CACHE_ENABLE"] = "1"
+            os.environ["ORT_TENSORRT_CACHE_PATH"] = args.trt_cache_dir
+            os.environ["ORT_TENSORRT_TIMING_CACHE_ENABLE"] = "1"
+
+        romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
+        if use_onnx:
+            romp_argv.append("--onnx")
+        backend = "TensorRT" if use_trt else ("ONNX-GPU" if use_onnx else "PyTorch")
+        print(f"[INIT] Initializing ROMP ({backend}) ...")
+        model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
+
+        # Rebuild the onnxruntime session with an EXPLICIT provider list so the
+        # backend is deterministic (ROMP's default list would silently prefer TRT).
+        if use_onnx:
+            if use_trt:
+                trt_opts = {
+                    "trt_fp16_enable": bool(args.trt_fp16),
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": args.trt_cache_dir,
+                    "trt_timing_cache_enable": True,
+                }
+                providers = [("TensorrtExecutionProvider", trt_opts),
+                             "CUDAExecutionProvider", "CPUExecutionProvider"]
+            else:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            model.ort_session = ort.InferenceSession(
+                model.settings.model_onnx_path, providers=providers)
+            # get_available_providers() lists TensorRT even when its DLL can't load
+            # (missing TensorRT/cuDNN on PATH -> LoadLibrary error 126), in which case
+            # ORT silently falls back. Trust the SESSION's active provider, not the
+            # requested list, so we never mislabel a CUDA run as TensorRT.
+            active = model.ort_session.get_providers()[0]
+            print(f"[INIT] ROMP session provider: {active}")
+            if use_trt and active != "TensorrtExecutionProvider":
+                print("[INIT] WARNING: --trt requested but the TensorRT EP did not "
+                      "load (see the EP Error above); running on "
+                      f"{active} instead. Install TensorRT 8.6.x (CUDA 11.8) and put "
+                      "its libs on PATH to enable it. This run is NOT TensorRT.")
+                use_trt = False
+
+        label = "ROMP-TRT" if use_trt else "ROMP"
+        print("[INIT] ROMP ready.")
+        return cls(model, name=label)
 
 
 class BevEstimator(PoseEstimator):
@@ -154,32 +329,92 @@ class BevEstimator(PoseEstimator):
         self.last_pj2d = None
         self.pj2d_smpl_map = self.PJ2D_SMPL_MAP
         self.last_betas = None
+        self._prof = _StageProfiler(self._name)
 
     @property
     def name(self):
         return self._name
 
     def estimate(self, frame_bgr):
-        with torch.no_grad():
-            out = self._model(frame_bgr)
-        if out is not None and out.get("smpl_thetas", None) is not None \
-                and len(out["smpl_thetas"]) > 0:
-            thetas = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
-            trans = None
-            ct = out.get("cam_trans", None)
-            if ct is not None and len(ct) > 0:
-                trans = np.asarray(ct[0], dtype=np.float32).reshape(-1)
-            pj = out.get("pj2d_org", None)
-            self.last_pj2d = (np.asarray(pj[0], dtype=np.float32)
-                              if pj is not None and len(pj) > 0 else None)
-            bt = out.get("smpl_betas", None)
-            # BEV betas are 11-d (SMPL-A); the contract / retarget path expect (10,).
-            self.last_betas = (np.asarray(bt[0], dtype=np.float32).reshape(-1)[:10]
-                               if bt is not None and len(bt) > 0 else None)
-            return thetas, trans
-        self.last_pj2d = None
-        self.last_betas = None
-        return None, None
+        with self._prof.stage("forward"):
+            with torch.no_grad():
+                out = self._model(frame_bgr)
+        with self._prof.stage("post"):
+            if out is not None and out.get("smpl_thetas", None) is not None \
+                    and len(out["smpl_thetas"]) > 0:
+                thetas = np.asarray(out["smpl_thetas"][0], dtype=np.float32).reshape(-1)
+                trans = None
+                ct = out.get("cam_trans", None)
+                if ct is not None and len(ct) > 0:
+                    trans = np.asarray(ct[0], dtype=np.float32).reshape(-1)
+                pj = out.get("pj2d_org", None)
+                self.last_pj2d = (np.asarray(pj[0], dtype=np.float32)
+                                  if pj is not None and len(pj) > 0 else None)
+                bt = out.get("smpl_betas", None)
+                # BEV betas are 11-d (SMPL-A); the contract / retarget path expect (10,).
+                self.last_betas = (np.asarray(bt[0], dtype=np.float32).reshape(-1)[:10]
+                                   if bt is not None and len(bt) > 0 else None)
+                result = (thetas, trans)
+            else:
+                self.last_pj2d = None
+                self.last_betas = None
+                result = (None, None)
+        self._prof.tick()
+        return result
+
+    @classmethod
+    def from_args(cls, args):
+        """Construct a BevEstimator (PyTorch backend; backbone optionally ONNX/TensorRT).
+
+        BEV shares ROMP's ~/.romp model directory. BEV.pth and SMPLA_NEUTRAL.pth are
+        the real BEV weights (auto-downloaded / already present).
+
+        SMIL (BEV's baby body model) is the one gap: it is NOT in the public ROMP release
+        (its download is commented out in bev_settings) and requires manual registration
+        with the SMIL project + packing via `bev.prepare_smil`. But SMPLA_parser only ever
+        *invokes* the SMIL model for detections flagged as babies (betas[..,10] kid offset);
+        for adult subjects -- the MISTA webcam/video use case -- it is constructed but never
+        called. So when smil_packed_info.pth is absent we point smil_path at the standard
+        SMPL_NEUTRAL.pth already in ~/.romp (same packed format, model_type='smpl'), which
+        lets BEV construct and run with identical adult output. If a real SMIL file is
+        present it is used as-is.
+
+        BEV's rendering/vis stack (Sim3DR_Cython, vis_human) pulls in a second OpenMP
+        runtime alongside torch's libiomp5md, which hard-aborts the process on Windows
+        (native exit 0xC06D007F) unless duplicates are allowed -- same guard the PARE and
+        HybrIK backends use. We also pass --render_mesh (a store_false flag: presence turns
+        OFF mesh rendering) so BEV skips the per-frame vertex render we never consume; the
+        2D joint projection (pj2d_org, used by --align) is gated by --calc_smpl, not
+        --render_mesh, so it is still produced.
+
+        --trt/--onnx accelerate BEV's HRNet backbone via onnxruntime (TensorRT/CUDA EP),
+        the same stack ROMP's --trt uses; the dynamic heads stay in PyTorch.
+        """
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        import bev  # lazy: only needed for the BEV backend
+
+        settings = bev.bev_settings(
+            input_args=["--GPU", "0", "--show_largest", "--calc_smpl", "--render_mesh"])
+        if not os.path.exists(settings.smil_path):
+            smpl_stub = os.path.join(os.path.dirname(settings.smpl_path), "SMPL_NEUTRAL.pth")
+            if not os.path.exists(smpl_stub):
+                raise FileNotFoundError(
+                    f"BEV needs a SMIL model at {settings.smil_path} (not in the public "
+                    f"ROMP release) or a fallback SMPL model at {smpl_stub}; neither exists. "
+                    "Provide SMPL_NEUTRAL.pth in ~/.romp (ROMP ships it) or a real SMIL file.")
+            print(f"[INIT] SMIL model not found at {settings.smil_path}; substituting "
+                  f"{smpl_stub} (baby model unused for adult subjects).")
+            settings.smil_path = smpl_stub
+
+        print("[INIT] Initializing BEV ...")
+        model = bev.BEV(settings)
+        # Optionally replace the HRNet backbone (the heavy CNN) with an onnxruntime
+        # TensorRT/CUDA session when --trt/--onnx is passed. BEV ships no ONNX graph, so
+        # we export the backbone once (cached at ~/.romp/BEV_backbone.onnx) and route only
+        # that static-shape CNN through TRT, keeping BEV's dynamic heads/parser in PyTorch.
+        label = _accelerate_bev_backbone(model, args)
+        print(f"[INIT] {label} ready.")
+        return cls(model, name=label)
 
 
 class PareEstimator(PoseEstimator):
@@ -230,6 +465,7 @@ class PareEstimator(PoseEstimator):
         self.pj2d_smpl_map = self.PJ2D_SMPL_MAP
         # Latest person's SMPL betas ((10,) float32) or None, from PARE's pred_shape.
         self.last_betas = None
+        self._prof = _StageProfiler("PARE")
 
     @property
     def name(self):
@@ -270,9 +506,12 @@ class PareEstimator(PoseEstimator):
         return (crop_px @ inv[:, :2].T + inv[:, 2]).astype(np.float32)
 
     def estimate(self, frame_bgr):
-        inp = self._crop_and_normalize(frame_bgr).unsqueeze(0)   # (1,3,H,W)
-        with torch.no_grad():
-            out = self._model(inp)
+        with self._prof.stage("preprocess"):
+            inp = self._crop_and_normalize(frame_bgr).unsqueeze(0)   # (1,3,H,W)
+        with self._prof.stage("forward"):
+            with torch.no_grad():
+                out = self._model(inp)
+        with self._prof.stage("post"):
             rotmat = out["pred_pose"].reshape(-1, 3, 3)          # (24,3,3) rotmat
             aa = self._rotmat_to_aa(rotmat).reshape(-1)          # (72,) axis-angle
             # 2D joints (normalized, crop-centered) -> original pixels, for PnP/bbox align.
@@ -285,9 +524,111 @@ class PareEstimator(PoseEstimator):
             shape = out.get("pred_shape", None)
             self.last_betas = (shape[0].detach().cpu().numpy().astype(np.float32).reshape(-1)
                                if shape is not None and len(shape) > 0 else None)
+            result = aa.detach().cpu().numpy().astype(np.float32)
+        self._prof.tick()
         # PARE's demo path exposes no consistent world translation here, so root
         # motion is simply disabled for this backend (trans = None).
-        return aa.detach().cpu().numpy().astype(np.float32), None
+        return result, None
+
+    @classmethod
+    def from_config(cls, pare_cfg, pare_ckpt, device, crop_size=224, scale=1.0):
+        """Instantiate the PARE network from its config + checkpoint, in eval mode.
+
+        Mirrors PARETester._build_model + _load_pretrained_model (pare/core/tester.py)
+        but without the multi-person tracker / video pipeline: we only need the raw
+        network forward on a pre-cropped frame. (--onnx/--no-onnx are ROMP-only and
+        simply don't apply here.)
+        """
+        if "--onnx" in sys.argv or "--no-onnx" in sys.argv:
+            print("[INIT] --onnx/--no-onnx only apply to the ROMP backend; ignored for PARE.")
+        # PARE's dependency stack pulls in a second OpenMP runtime (libomp alongside
+        # torch's libiomp5md), which aborts on Windows unless duplicates are allowed.
+        # The ROMP path does not trigger this, so we only set it for PARE, and only
+        # if the user hasn't already chosen a value.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        print(f"[INIT] Initializing PARE from {pare_ckpt} ...")
+
+        # Ensure the vendored PARE package (submodules/PARE) is importable.
+        pare_root = os.path.join(_ROOT, "submodules", "PARE")
+        if os.path.isdir(pare_root) and pare_root not in sys.path:
+            sys.path.insert(0, pare_root)
+
+        # Compat shim: newer torchvision (matching torch 2.x) removed
+        # torchvision.models.utils; load_state_dict_from_url now lives in torch.hub.
+        # PARE's vendored backbones still import the old path.
+        import types
+        import torch.hub as _hub
+        import torchvision.models as _tvm
+        if not hasattr(_tvm, "utils"):
+            _shim = types.ModuleType("torchvision.models.utils")
+            _shim.load_state_dict_from_url = _hub.load_state_dict_from_url
+            sys.modules["torchvision.models.utils"] = _shim
+
+        from pare.core.config import update_hparams
+        from pare.models import PARE
+
+        # PARE resolves its SMPL body model / regressors via paths relative to CWD
+        # (e.g. 'data/body_models/smpl', see pare/core/config.py). Those files live
+        # under the submodule, so build the model with CWD switched to pare_root.
+        # Resolve cfg/ckpt to absolute first so they survive the chdir.
+        pare_cfg = os.path.abspath(pare_cfg)
+        pare_ckpt = os.path.abspath(pare_ckpt)
+        _prev_cwd = os.getcwd()
+        os.chdir(pare_root)
+        try:
+            hparams = update_hparams(pare_cfg)
+            model = cls._construct(PARE, hparams, device)
+            ckpt = torch.load(pare_ckpt, map_location=device)["state_dict"]
+            # Checkpoint keys are prefixed with "model." (LightningModule); strip.
+            state = {k.replace("model.", "", 1): v for k, v in ckpt.items()
+                     if k.startswith("model.")}
+            model.load_state_dict(state, strict=False)
+        finally:
+            os.chdir(_prev_cwd)
+        model.eval()
+        print("[INIT] PARE ready.")
+        return cls(model, device, crop_size=crop_size, scale=scale)
+
+    @staticmethod
+    def _construct(PARE, hparams, device):
+        """Instantiate the PARE nn.Module from hparams (split out for readability)."""
+        return PARE(
+            backbone=hparams.PARE.BACKBONE,
+            num_joints=hparams.PARE.NUM_JOINTS,
+            softmax_temp=hparams.PARE.SOFTMAX_TEMP,
+            num_features_smpl=hparams.PARE.NUM_FEATURES_SMPL,
+            focal_length=hparams.DATASET.FOCAL_LENGTH,
+            img_res=hparams.DATASET.IMG_RES,
+            pretrained=hparams.TRAINING.PRETRAINED,
+            iterative_regression=hparams.PARE.ITERATIVE_REGRESSION,
+            num_iterations=hparams.PARE.NUM_ITERATIONS,
+            iter_residual=hparams.PARE.ITER_RESIDUAL,
+            shape_input_type=hparams.PARE.SHAPE_INPUT_TYPE,
+            pose_input_type=hparams.PARE.POSE_INPUT_TYPE,
+            pose_mlp_num_layers=hparams.PARE.POSE_MLP_NUM_LAYERS,
+            shape_mlp_num_layers=hparams.PARE.SHAPE_MLP_NUM_LAYERS,
+            pose_mlp_hidden_size=hparams.PARE.POSE_MLP_HIDDEN_SIZE,
+            shape_mlp_hidden_size=hparams.PARE.SHAPE_MLP_HIDDEN_SIZE,
+            use_keypoint_features_for_smpl_regression=hparams.PARE.USE_KEYPOINT_FEATURES_FOR_SMPL_REGRESSION,
+            use_heatmaps=hparams.DATASET.USE_HEATMAPS,
+            use_keypoint_attention=hparams.PARE.USE_KEYPOINT_ATTENTION,
+            use_postconv_keypoint_attention=hparams.PARE.USE_POSTCONV_KEYPOINT_ATTENTION,
+            use_coattention=hparams.PARE.USE_COATTENTION,
+            num_coattention_iter=hparams.PARE.NUM_COATTENTION_ITER,
+            coattention_conv=hparams.PARE.COATTENTION_CONV,
+            use_upsampling=hparams.PARE.USE_UPSAMPLING,
+            deconv_conv_kernel_size=hparams.PARE.DECONV_CONV_KERNEL_SIZE,
+            use_soft_attention=hparams.PARE.USE_SOFT_ATTENTION,
+            num_branch_iteration=hparams.PARE.NUM_BRANCH_ITERATION,
+            branch_deeper=hparams.PARE.BRANCH_DEEPER,
+            num_deconv_layers=hparams.PARE.NUM_DECONV_LAYERS,
+            num_deconv_filters=hparams.PARE.NUM_DECONV_FILTERS,
+            use_resnet_conv_hrnet=hparams.PARE.USE_RESNET_CONV_HRNET,
+            use_position_encodings=hparams.PARE.USE_POS_ENC,
+            use_mean_camshape=hparams.PARE.USE_MEAN_CAMSHAPE,
+            use_mean_pose=hparams.PARE.USE_MEAN_POSE,
+            init_xavier=hparams.PARE.INIT_XAVIER,
+        ).to(device)
 
 
 class HybrIKEstimator(PoseEstimator):
@@ -326,6 +667,7 @@ class HybrIKEstimator(PoseEstimator):
         # (avatar tipped over) and degraded body pose. Detector-free tracking keeps it
         # real-time on the RTX 1080 while giving the network the tight crop it expects.
         self._bbox = None
+        self._prof = _StageProfiler("HybrIK")
 
     @property
     def name(self):
@@ -346,25 +688,27 @@ class HybrIKEstimator(PoseEstimator):
                          cx + side / 2, cy + side / 2], dtype=np.float32)
 
     def estimate(self, frame_bgr):
-        img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        h, w = img.shape[:2]
-        # Person bbox (xyxy): tracked from the previous frame's predicted 2D joints;
-        # full frame only on the first frame (cold start, corrected within one frame).
-        tight_bbox = (self._bbox if self._bbox is not None
-                      else np.array([0.0, 0.0, float(w), float(h)], dtype=np.float32))
-        pose_input, bbox, img_center = self._transform.test_transform(img, tight_bbox)
-        pose_input = pose_input.to(self._device)[None, :, :, :]
-        with torch.no_grad():
-            # flip_test=False: HybrIK's flip branch has an upstream bug (it feeds the
-            # raw pooled features `flip_x0` into self.decsigma instead of the fc-processed
-            # `flip_xc`, causing a 512-vs-1024 matmul error). Flip test is only a small
-            # test-time-augmentation accuracy bump and doubles the forward cost, so we
-            # disable it — better for real-time and sidesteps the bug.
-            out = self._model(
-                pose_input, flip_test=False,
-                bboxes=torch.from_numpy(np.asarray(bbox)).to(self._device).unsqueeze(0).float(),
-                img_center=torch.from_numpy(np.asarray(img_center)).to(self._device).unsqueeze(0).float(),
-            )
+        with self._prof.stage("preprocess"):
+            img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            h, w = img.shape[:2]
+            # Person bbox (xyxy): tracked from the previous frame's predicted 2D joints;
+            # full frame only on the first frame (cold start, corrected within one frame).
+            tight_bbox = (self._bbox if self._bbox is not None
+                          else np.array([0.0, 0.0, float(w), float(h)], dtype=np.float32))
+            pose_input, bbox, img_center = self._transform.test_transform(img, tight_bbox)
+            pose_input = pose_input.to(self._device)[None, :, :, :]
+        with self._prof.stage("forward"):
+            with torch.no_grad():
+                # flip_test=False: HybrIK's flip branch has an upstream bug (it feeds the
+                # raw pooled features `flip_x0` into self.decsigma instead of the fc-processed
+                # `flip_xc`, causing a 512-vs-1024 matmul error). Flip test is only a small
+                # test-time-augmentation accuracy bump and doubles the forward cost, so we
+                # disable it — better for real-time and sidesteps the bug.
+                out = self._model(
+                    pose_input, flip_test=False,
+                    bboxes=torch.from_numpy(np.asarray(bbox)).to(self._device).unsqueeze(0).float(),
+                    img_center=torch.from_numpy(np.asarray(img_center)).to(self._device).unsqueeze(0).float(),
+                )
         # pred_theta_mats: (1, 24*9) SMPL joint rotation matrices -> (24,3,3) -> (72,) aa.
         rotmats = out.pred_theta_mats.reshape(-1, 3, 3)[:24].detach().cpu().numpy()
         aa = _rotmats_to_axis_angle(rotmats)
@@ -433,188 +777,107 @@ class HybrIKEstimator(PoseEstimator):
         transl = getattr(out, "transl", None)
         if transl is not None:
             transl = transl.reshape(-1)[:3].detach().cpu().numpy().astype(np.float32)
+        self._prof.tick()
         return aa, transl
 
+    @classmethod
+    def from_config(cls, hybrik_cfg, hybrik_ckpt, device):
+        """Instantiate the HybrIK network + its preprocessing transform, in eval mode.
 
-def _build_hybrik_model(hybrik_cfg: str, hybrik_ckpt: str, device):
-    """Instantiate the HybrIK network + its preprocessing transform, in eval mode.
+        Mirrors HybrIK's scripts/demo_video.py setup (builder.build_sppe + the
+        SimpleTransform3DSMPLCam test transform) minus the Faster R-CNN detector and
+        the video/tracking loop: we only need the raw network forward on a full-frame
+        crop.
+        """
+        # HybrIK's stack (like PARE's) can pull in a second OpenMP runtime; allow the
+        # duplicate on Windows unless the user already chose a value. --onnx/--trt are
+        # ROMP-only and simply don't apply here.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        print(f"[INIT] Initializing HybrIK from {hybrik_ckpt} ...")
 
-    Mirrors HybrIK's scripts/demo_video.py setup (builder.build_sppe + the
-    SimpleTransform3DSMPLCam test transform) minus the Faster R-CNN detector and
-    the video/tracking loop: we only need the raw network forward on a full-frame
-    crop. Returns (model, transform).
-    """
-    # Ensure the vendored HybrIK package (submodules/HybrIK) is importable.
-    hybrik_root = os.path.join(_ROOT, "submodules", "HybrIK")
-    if os.path.isdir(hybrik_root) and hybrik_root not in sys.path:
-        sys.path.insert(0, hybrik_root)
+        # Ensure the vendored HybrIK package (submodules/HybrIK) is importable.
+        hybrik_root = os.path.join(_ROOT, "submodules", "HybrIK")
+        if os.path.isdir(hybrik_root) and hybrik_root not in sys.path:
+            sys.path.insert(0, hybrik_root)
 
-    # HybrIK's SMPL layer imports two pure-torch helpers from pytorch3d
-    # (axis_angle_to_matrix / matrix_to_axis_angle). Building the real pytorch3d on
-    # Windows is painful and we never use its CUDA renderer, so fall back to the
-    # bundled shim (pipeline/_p3d_shim) only when pytorch3d isn't already installed.
-    try:
-        import pytorch3d.transforms.rotation_conversions  # noqa: F401
-    except Exception:
-        shim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_p3d_shim")
-        if shim_dir not in sys.path:
-            sys.path.insert(0, shim_dir)
-        print("[INIT] pytorch3d not found; using bundled rotation-conversion shim.")
+        # HybrIK's SMPL layer imports two pure-torch helpers from pytorch3d
+        # (axis_angle_to_matrix / matrix_to_axis_angle). Building the real pytorch3d on
+        # Windows is painful and we never use its CUDA renderer, so fall back to the
+        # bundled shim (pipeline/_p3d_shim) only when pytorch3d isn't already installed.
+        try:
+            import pytorch3d.transforms.rotation_conversions  # noqa: F401
+        except Exception:
+            shim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_p3d_shim")
+            if shim_dir not in sys.path:
+                sys.path.insert(0, shim_dir)
+            print("[INIT] pytorch3d not found; using bundled rotation-conversion shim.")
 
-    # hybrik.utils.presets.__init__ eagerly imports the SMPL-X transform, which
-    # instantiates SMPLXLayer objects at module load (needing model_files/smplx/*.npz).
-    # Our res34 path uses only the SMPL transform (SimpleTransform3DSMPLCam), so stub
-    # the SMPL-X submodule to avoid requiring SMPL-X model files we never use.
-    import types as _types
-    _smplx_mod = "hybrik.utils.presets.simple_transform_3d_smplx"
-    if _smplx_mod not in sys.modules:
-        _stub = _types.ModuleType(_smplx_mod)
+        # hybrik.utils.presets.__init__ eagerly imports the SMPL-X transform, which
+        # instantiates SMPLXLayer objects at module load (needing model_files/smplx/*.npz).
+        # Our res34 path uses only the SMPL transform (SimpleTransform3DSMPLCam), so stub
+        # the SMPL-X submodule to avoid requiring SMPL-X model files we never use.
+        import types as _types
+        _smplx_mod = "hybrik.utils.presets.simple_transform_3d_smplx"
+        if _smplx_mod not in sys.modules:
+            _stub = _types.ModuleType(_smplx_mod)
 
-        class _UnavailSMPLX:  # only reached if someone actually uses the SMPL-X path
-            def __init__(self, *a, **k):
-                raise RuntimeError("HybrIK SMPL-X transform is not enabled in this "
-                                   "integration (SMPL-only res34 path).")
+            class _UnavailSMPLX:  # only reached if someone actually uses the SMPL-X path
+                def __init__(self, *a, **k):
+                    raise RuntimeError("HybrIK SMPL-X transform is not enabled in this "
+                                       "integration (SMPL-only res34 path).")
 
-        _stub.SimpleTransform3DSMPLX = _UnavailSMPLX
-        sys.modules[_smplx_mod] = _stub
+            _stub.SimpleTransform3DSMPLX = _UnavailSMPLX
+            sys.modules[_smplx_mod] = _stub
 
-    from easydict import EasyDict as edict
-    from hybrik.models import builder
-    from hybrik.utils.config import update_config
-    from hybrik.utils.presets import SimpleTransform3DSMPLCam
+        from easydict import EasyDict as edict
+        from hybrik.models import builder
+        from hybrik.utils.config import update_config
+        from hybrik.utils.presets import SimpleTransform3DSMPLCam
 
-    # HybrIK resolves its SMPL body model / joint regressors via paths relative to
-    # CWD (model_files/..., see its config), which live under the submodule, so build
-    # with CWD switched to hybrik_root. Resolve cfg/ckpt to absolute first.
-    hybrik_cfg = os.path.abspath(hybrik_cfg)
-    hybrik_ckpt = os.path.abspath(hybrik_ckpt)
-    _prev_cwd = os.getcwd()
-    os.chdir(hybrik_root)
-    try:
-        cfg = update_config(hybrik_cfg)
-        # Follow demo_video.py exactly: read the 3D bbox shape (mm) and convert to
-        # metres. Must match the chosen config's DATA/MODEL preset.
-        bbox_3d_shape = getattr(cfg.MODEL, "BBOX_3D_SHAPE", (2000, 2000, 2000))
-        bbox_3d_shape = [item * 1e-3 for item in bbox_3d_shape]
-        # Dummy dataset: the transform only needs bbox_3d_shape here; joint_pairs are
-        # for flip augmentation, which flip_test handles inside the model, not here.
-        dummy_set = edict({
-            "joint_pairs_17": None,
-            "joint_pairs_24": None,
-            "joint_pairs_29": None,
-            "bbox_3d_shape": bbox_3d_shape,
-        })
-        transform = SimpleTransform3DSMPLCam(
-            dummy_set, scale_factor=cfg.DATASET.SCALE_FACTOR,
-            color_factor=cfg.DATASET.COLOR_FACTOR,
-            occlusion=cfg.DATASET.OCCLUSION,
-            input_size=cfg.MODEL.IMAGE_SIZE,
-            output_size=cfg.MODEL.HEATMAP_SIZE,
-            depth_dim=cfg.MODEL.EXTRA.DEPTH_DIM,
-            bbox_3d_shape=bbox_3d_shape,
-            rot=cfg.DATASET.ROT_FACTOR, sigma=cfg.MODEL.EXTRA.SIGMA,
-            train=False, add_dpg=False,
-            loss_type=cfg.LOSS["TYPE"])
-        model = builder.build_sppe(cfg.MODEL)
-        save_dict = torch.load(hybrik_ckpt, map_location="cpu")
-        model_dict = (save_dict["model"]
-                      if isinstance(save_dict, dict) and "model" in save_dict
-                      else save_dict)
-        model.load_state_dict(model_dict, strict=False)
-    finally:
-        os.chdir(_prev_cwd)
-    model = model.to(device)
-    model.eval()
-    return model, transform
-
-
-def _build_pare_model(pare_cfg: str, pare_ckpt: str, device):
-    """Instantiate the PARE network from its config + checkpoint, in eval mode.
-
-    Mirrors PARETester._build_model + _load_pretrained_model (pare/core/tester.py)
-    but without the multi-person tracker / video pipeline: we only need the raw
-    network forward on a pre-cropped frame.
-    """
-    # Ensure the vendored PARE package (submodules/PARE) is importable.
-    pare_root = os.path.join(_ROOT, "submodules", "PARE")
-    if os.path.isdir(pare_root) and pare_root not in sys.path:
-        sys.path.insert(0, pare_root)
-
-    # Compat shim: newer torchvision (matching torch 2.x) removed
-    # torchvision.models.utils; load_state_dict_from_url now lives in torch.hub.
-    # PARE's vendored backbones still import the old path.
-    import types
-    import torch.hub as _hub
-    import torchvision.models as _tvm
-    if not hasattr(_tvm, "utils"):
-        _shim = types.ModuleType("torchvision.models.utils")
-        _shim.load_state_dict_from_url = _hub.load_state_dict_from_url
-        sys.modules["torchvision.models.utils"] = _shim
-
-    from pare.core.config import update_hparams
-    from pare.models import PARE
-
-    # PARE resolves its SMPL body model / regressors via paths relative to CWD
-    # (e.g. 'data/body_models/smpl', see pare/core/config.py). Those files live
-    # under the submodule, so build the model with CWD switched to pare_root.
-    # Resolve cfg/ckpt to absolute first so they survive the chdir.
-    pare_cfg = os.path.abspath(pare_cfg)
-    pare_ckpt = os.path.abspath(pare_ckpt)
-    _prev_cwd = os.getcwd()
-    os.chdir(pare_root)
-    try:
-        hparams = update_hparams(pare_cfg)
-        model = _construct_pare(PARE, hparams, device)
-        ckpt = torch.load(pare_ckpt, map_location=device)["state_dict"]
-        # Checkpoint keys are prefixed with "model." (LightningModule); strip.
-        state = {k.replace("model.", "", 1): v for k, v in ckpt.items()
-                 if k.startswith("model.")}
-        model.load_state_dict(state, strict=False)
-    finally:
-        os.chdir(_prev_cwd)
-    model.eval()
-    return model
-
-
-def _construct_pare(PARE, hparams, device):
-    """Instantiate the PARE nn.Module from hparams (split out for readability)."""
-    return PARE(
-        backbone=hparams.PARE.BACKBONE,
-        num_joints=hparams.PARE.NUM_JOINTS,
-        softmax_temp=hparams.PARE.SOFTMAX_TEMP,
-        num_features_smpl=hparams.PARE.NUM_FEATURES_SMPL,
-        focal_length=hparams.DATASET.FOCAL_LENGTH,
-        img_res=hparams.DATASET.IMG_RES,
-        pretrained=hparams.TRAINING.PRETRAINED,
-        iterative_regression=hparams.PARE.ITERATIVE_REGRESSION,
-        num_iterations=hparams.PARE.NUM_ITERATIONS,
-        iter_residual=hparams.PARE.ITER_RESIDUAL,
-        shape_input_type=hparams.PARE.SHAPE_INPUT_TYPE,
-        pose_input_type=hparams.PARE.POSE_INPUT_TYPE,
-        pose_mlp_num_layers=hparams.PARE.POSE_MLP_NUM_LAYERS,
-        shape_mlp_num_layers=hparams.PARE.SHAPE_MLP_NUM_LAYERS,
-        pose_mlp_hidden_size=hparams.PARE.POSE_MLP_HIDDEN_SIZE,
-        shape_mlp_hidden_size=hparams.PARE.SHAPE_MLP_HIDDEN_SIZE,
-        use_keypoint_features_for_smpl_regression=hparams.PARE.USE_KEYPOINT_FEATURES_FOR_SMPL_REGRESSION,
-        use_heatmaps=hparams.DATASET.USE_HEATMAPS,
-        use_keypoint_attention=hparams.PARE.USE_KEYPOINT_ATTENTION,
-        use_postconv_keypoint_attention=hparams.PARE.USE_POSTCONV_KEYPOINT_ATTENTION,
-        use_coattention=hparams.PARE.USE_COATTENTION,
-        num_coattention_iter=hparams.PARE.NUM_COATTENTION_ITER,
-        coattention_conv=hparams.PARE.COATTENTION_CONV,
-        use_upsampling=hparams.PARE.USE_UPSAMPLING,
-        deconv_conv_kernel_size=hparams.PARE.DECONV_CONV_KERNEL_SIZE,
-        use_soft_attention=hparams.PARE.USE_SOFT_ATTENTION,
-        num_branch_iteration=hparams.PARE.NUM_BRANCH_ITERATION,
-        branch_deeper=hparams.PARE.BRANCH_DEEPER,
-        num_deconv_layers=hparams.PARE.NUM_DECONV_LAYERS,
-        num_deconv_filters=hparams.PARE.NUM_DECONV_FILTERS,
-        use_resnet_conv_hrnet=hparams.PARE.USE_RESNET_CONV_HRNET,
-        use_position_encodings=hparams.PARE.USE_POS_ENC,
-        use_mean_camshape=hparams.PARE.USE_MEAN_CAMSHAPE,
-        use_mean_pose=hparams.PARE.USE_MEAN_POSE,
-        init_xavier=hparams.PARE.INIT_XAVIER,
-    ).to(device)
+        # HybrIK resolves its SMPL body model / joint regressors via paths relative to
+        # CWD (model_files/..., see its config), which live under the submodule, so build
+        # with CWD switched to hybrik_root. Resolve cfg/ckpt to absolute first.
+        hybrik_cfg = os.path.abspath(hybrik_cfg)
+        hybrik_ckpt = os.path.abspath(hybrik_ckpt)
+        _prev_cwd = os.getcwd()
+        os.chdir(hybrik_root)
+        try:
+            cfg = update_config(hybrik_cfg)
+            # Follow demo_video.py exactly: read the 3D bbox shape (mm) and convert to
+            # metres. Must match the chosen config's DATA/MODEL preset.
+            bbox_3d_shape = getattr(cfg.MODEL, "BBOX_3D_SHAPE", (2000, 2000, 2000))
+            bbox_3d_shape = [item * 1e-3 for item in bbox_3d_shape]
+            # Dummy dataset: the transform only needs bbox_3d_shape here; joint_pairs are
+            # for flip augmentation, which flip_test handles inside the model, not here.
+            dummy_set = edict({
+                "joint_pairs_17": None,
+                "joint_pairs_24": None,
+                "joint_pairs_29": None,
+                "bbox_3d_shape": bbox_3d_shape,
+            })
+            transform = SimpleTransform3DSMPLCam(
+                dummy_set, scale_factor=cfg.DATASET.SCALE_FACTOR,
+                color_factor=cfg.DATASET.COLOR_FACTOR,
+                occlusion=cfg.DATASET.OCCLUSION,
+                input_size=cfg.MODEL.IMAGE_SIZE,
+                output_size=cfg.MODEL.HEATMAP_SIZE,
+                depth_dim=cfg.MODEL.EXTRA.DEPTH_DIM,
+                bbox_3d_shape=bbox_3d_shape,
+                rot=cfg.DATASET.ROT_FACTOR, sigma=cfg.MODEL.EXTRA.SIGMA,
+                train=False, add_dpg=False,
+                loss_type=cfg.LOSS["TYPE"])
+            model = builder.build_sppe(cfg.MODEL)
+            save_dict = torch.load(hybrik_ckpt, map_location="cpu")
+            model_dict = (save_dict["model"]
+                          if isinstance(save_dict, dict) and "model" in save_dict
+                          else save_dict)
+            model.load_state_dict(model_dict, strict=False)
+        finally:
+            os.chdir(_prev_cwd)
+        model = model.to(device)
+        model.eval()
+        print("[INIT] HybrIK ready.")
+        return cls(model, transform, device)
 
 
 def _prepend_trt_dll_path(trt_lib_dir):
@@ -642,103 +905,6 @@ def _prepend_trt_dll_path(trt_lib_dir):
         pass
     if parts:
         os.environ["PATH"] = os.pathsep.join(parts) + os.pathsep + os.environ.get("PATH", "")
-
-
-def _build_romp_model(args):
-    """Construct romp.ROMP with the ONNX/CUDA/TensorRT backend selected by args.
-
-    Returns (model, label) where label describes the active backend for logging.
-
-    ONNX-GPU is ROMP's real-time path; TensorRT (--trt) routes that SAME ONNX
-    graph through onnxruntime's TensorRT execution provider for a clean A/B. We
-    set the providers EXPLICITLY after construction (ROMP hardcodes
-    [TRT, CUDA, CPU] in romp/main.py) so the non-TRT baseline is pure CUDA and
-    the TRT path carries FP16 + a persistent engine cache. We never fall back to
-    the CPU-ONNX provider (slower than ROMP's PyTorch backbone).
-    """
-    import romp  # lazy: only needed for the ROMP backend
-
-    use_onnx = args.onnx
-    use_trt = bool(getattr(args, "trt", False))
-
-    # Put TensorRT's (and cuDNN's) DLLs on PATH BEFORE onnxruntime is imported.
-    # onnxruntime's TensorRT provider (onnxruntime_providers_tensorrt.dll) resolves
-    # its dependencies (nvinfer*.dll + cuDNN) via the process PATH -- NOT via
-    # os.add_dll_directory -- so a missing entry surfaces as LoadLibrary error 126.
-    # cuDNN 8 ships inside torch/lib; ORT 1.15.x's TRT EP is happy with it (1.16.x
-    # wants cuDNN 8.9 and clashes with torch's 8.7). Must run before `import
-    # onnxruntime` so the provider sees the augmented PATH.
-    if use_trt:
-        _prepend_trt_dll_path(getattr(args, "trt_lib_dir", None))
-
-    ort = None
-    if use_onnx:
-        try:
-            import onnxruntime as ort
-        except ImportError:
-            print("[INIT] onnxruntime not installed; "
-                  "falling back to ROMP PyTorch backend.")
-            use_onnx = use_trt = False
-    if use_onnx:
-        available = ort.get_available_providers()
-        if use_trt and "TensorrtExecutionProvider" not in available:
-            print("[INIT] onnxruntime has no TensorrtExecutionProvider; "
-                  "falling back to the CUDA ONNX backend.")
-            use_trt = False
-        if "CUDAExecutionProvider" not in available:
-            print("[INIT] onnxruntime has no CUDAExecutionProvider; "
-                  "falling back to ROMP PyTorch backend.")
-            use_onnx = use_trt = False
-
-    # Pre-seed the TensorRT EP env options BEFORE constructing ROMP, so the
-    # session ROMP builds internally (its hardcoded [TRT, CUDA, CPU] list) shares
-    # the same engine/timing cache we reuse below -- no wasted first engine build.
-    if use_trt:
-        os.makedirs(args.trt_cache_dir, exist_ok=True)
-        os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1" if args.trt_fp16 else "0"
-        os.environ["ORT_TENSORRT_ENGINE_CACHE_ENABLE"] = "1"
-        os.environ["ORT_TENSORRT_CACHE_PATH"] = args.trt_cache_dir
-        os.environ["ORT_TENSORRT_TIMING_CACHE_ENABLE"] = "1"
-
-    romp_argv = ["--GPU", "0", "--show_largest", "--calc_smpl"]
-    if use_onnx:
-        romp_argv.append("--onnx")
-    backend = "TensorRT" if use_trt else ("ONNX-GPU" if use_onnx else "PyTorch")
-    print(f"[INIT] Initializing ROMP ({backend}) ...")
-    model = romp.ROMP(romp.romp_settings(input_args=romp_argv))
-
-    # Rebuild the onnxruntime session with an EXPLICIT provider list so the
-    # backend is deterministic (ROMP's default list would silently prefer TRT).
-    if use_onnx:
-        if use_trt:
-            trt_opts = {
-                "trt_fp16_enable": bool(args.trt_fp16),
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": args.trt_cache_dir,
-                "trt_timing_cache_enable": True,
-            }
-            providers = [("TensorrtExecutionProvider", trt_opts),
-                         "CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        model.ort_session = ort.InferenceSession(
-            model.settings.model_onnx_path, providers=providers)
-        # get_available_providers() lists TensorRT even when its DLL can't load
-        # (missing TensorRT/cuDNN on PATH -> LoadLibrary error 126), in which case
-        # ORT silently falls back. Trust the SESSION's active provider, not the
-        # requested list, so we never mislabel a CUDA run as TensorRT.
-        active = model.ort_session.get_providers()[0]
-        print(f"[INIT] ROMP session provider: {active}")
-        if use_trt and active != "TensorrtExecutionProvider":
-            print("[INIT] WARNING: --trt requested but the TensorRT EP did not "
-                  "load (see the EP Error above); running on "
-                  f"{active} instead. Install TensorRT 8.6.x (CUDA 11.8) and put "
-                  "its libs on PATH to enable it. This run is NOT TensorRT.")
-            use_trt = False
-
-    label = "ROMP-TRT" if use_trt else "ROMP"
-    print("[INIT] ROMP ready.")
-    return model, label
 
 
 class _OrtBackbone(torch.nn.Module):
@@ -857,88 +1023,16 @@ def _accelerate_bev_backbone(model, args):
     return "BEV-TRT" if use_trt else "BEV-ONNX"
 
 
-def _build_bev_model(args):
-    """Construct bev.BEV (PyTorch backend; backbone optionally ONNX/TensorRT).
-
-    Returns (model, label). BEV shares ROMP's ~/.romp model directory. BEV.pth and
-    SMPLA_NEUTRAL.pth are the real BEV weights (auto-downloaded / already present).
-
-    SMIL (BEV's baby body model) is the one gap: it is NOT in the public ROMP release
-    (its download is commented out in bev_settings) and requires manual registration
-    with the SMIL project + packing via `bev.prepare_smil`. But SMPLA_parser only ever
-    *invokes* the SMIL model for detections flagged as babies (betas[..,10] kid offset);
-    for adult subjects -- the MISTA webcam/video use case -- it is constructed but never
-    called. So when smil_packed_info.pth is absent we point smil_path at the standard
-    SMPL_NEUTRAL.pth already in ~/.romp (same packed format, model_type='smpl'), which
-    lets BEV construct and run with identical adult output. If a real SMIL file is
-    present it is used as-is.
-
-    BEV's rendering/vis stack (Sim3DR_Cython, vis_human) pulls in a second OpenMP
-    runtime alongside torch's libiomp5md, which hard-aborts the process on Windows
-    (native exit 0xC06D007F) unless duplicates are allowed -- same guard the PARE and
-    HybrIK backends use. We also pass --render_mesh (a store_false flag: presence turns
-    OFF mesh rendering) so BEV skips the per-frame vertex render we never consume; the
-    2D joint projection (pj2d_org, used by --align) is gated by --calc_smpl, not
-    --render_mesh, so it is still produced."""
-    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    import bev  # lazy: only needed for the BEV backend
-
-    settings = bev.bev_settings(
-        input_args=["--GPU", "0", "--show_largest", "--calc_smpl", "--render_mesh"])
-    if not os.path.exists(settings.smil_path):
-        smpl_stub = os.path.join(os.path.dirname(settings.smpl_path), "SMPL_NEUTRAL.pth")
-        if not os.path.exists(smpl_stub):
-            raise FileNotFoundError(
-                f"BEV needs a SMIL model at {settings.smil_path} (not in the public "
-                f"ROMP release) or a fallback SMPL model at {smpl_stub}; neither exists. "
-                "Provide SMPL_NEUTRAL.pth in ~/.romp (ROMP ships it) or a real SMIL file.")
-        print(f"[INIT] SMIL model not found at {settings.smil_path}; substituting "
-              f"{smpl_stub} (baby model unused for adult subjects).")
-        settings.smil_path = smpl_stub
-
-    print("[INIT] Initializing BEV ...")
-    model = bev.BEV(settings)
-    # Optionally replace the HRNet backbone (the heavy CNN) with an onnxruntime
-    # TensorRT/CUDA session when --trt/--onnx is passed. BEV ships no ONNX graph, so
-    # we export the backbone once (cached at ~/.romp/BEV_backbone.onnx) and route only
-    # that static-shape CNN through TRT, keeping BEV's dynamic heads/parser in PyTorch.
-    label = _accelerate_bev_backbone(model, args)
-    print(f"[INIT] {label} ready.")
-    return model, label
-
-
 def build_estimator(args, device) -> PoseEstimator:
-    """Factory: construct the selected PoseEstimator backend. Keeps main() and
-    the source class free of any backend-specific imports/branching."""
+    """Factory: construct the selected PoseEstimator backend. Keeps main() and the
+    source class free of any backend-specific imports/branching. Each backend's
+    construction (imports, OpenMP guard, ONNX/TensorRT setup, logging) lives in its
+    own class's from_args/from_config classmethod; this dispatcher just selects one."""
     if args.estimator == "romp":
-        model, label = _build_romp_model(args)
-        return RompEstimator(model, name=label)
-
+        return RompEstimator.from_args(args)
     if args.estimator == "bev":
-        # --trt/--onnx accelerate BEV's HRNet backbone via onnxruntime (TensorRT/CUDA
-        # EP), the same stack ROMP's --trt uses; the dynamic heads stay in PyTorch.
-        model, label = _build_bev_model(args)
-        return BevEstimator(model, name=label)
-
+        return BevEstimator.from_args(args)
     if args.estimator == "hybrik":
-        # HybrIK's stack (like PARE's) can pull in a second OpenMP runtime; allow the
-        # duplicate on Windows unless the user already chose a value. --onnx/--trt are
-        # ROMP-only and simply don't apply here.
-        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-        print(f"[INIT] Initializing HybrIK from {args.hybrik_ckpt} ...")
-        model, transform = _build_hybrik_model(args.hybrik_cfg, args.hybrik_ckpt, device)
-        print("[INIT] HybrIK ready.")
-        return HybrIKEstimator(model, transform, device)
-
-    # PARE backend. (--onnx/--no-onnx are ROMP-only and simply don't apply here.)
-    if "--onnx" in sys.argv or "--no-onnx" in sys.argv:
-        print("[INIT] --onnx/--no-onnx only apply to the ROMP backend; ignored for PARE.")
-    # PARE's dependency stack pulls in a second OpenMP runtime (libomp alongside
-    # torch's libiomp5md), which aborts on Windows unless duplicates are allowed.
-    # The ROMP path does not trigger this, so we only set it for PARE, and only
-    # if the user hasn't already chosen a value.
-    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    print(f"[INIT] Initializing PARE from {args.pare_ckpt} ...")
-    model = _build_pare_model(args.pare_cfg, args.pare_ckpt, device)
-    print("[INIT] PARE ready.")
-    return PareEstimator(model, device, crop_size=args.pare_crop_size, scale=args.pare_scale)
+        return HybrIKEstimator.from_config(args.hybrik_cfg, args.hybrik_ckpt, device)
+    return PareEstimator.from_config(args.pare_cfg, args.pare_ckpt, device,
+                                     crop_size=args.pare_crop_size, scale=args.pare_scale)
