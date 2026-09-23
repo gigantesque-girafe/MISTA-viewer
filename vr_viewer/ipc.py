@@ -25,15 +25,21 @@ log = logging.getLogger("vr_viewer.ipc")
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _IpcMem(ctypes.Structure):
+    """ctypes mirror of CUDA's `cudaIpcMemHandle_t` (64 opaque bytes)."""
     _fields_ = [("raw", ctypes.c_byte * 64)]
 
 
 class _IpcEvt(ctypes.Structure):
+    """ctypes mirror of CUDA's `cudaIpcEventHandle_t` (64 opaque bytes)."""
     _fields_ = [("raw", ctypes.c_byte * 64)]
 
 
 def load_cuda_runtime() -> ctypes.CDLL:
-    """Load CUDA runtime DLL/SO. Tries CUDA 11.8 first (this project's version)."""
+    """Load the CUDA runtime shared library, preferring CUDA 11.8.
+
+    @return: loaded ctypes.CDLL for the CUDA runtime.
+    @throws OSError: if no matching CUDA runtime library can be found/loaded.
+    """
     if sys.platform == "win32":
         for name in ["cudart64_118.dll", "cudart64_110.dll", "cudart64_12.dll"]:
             try:
@@ -63,7 +69,14 @@ def load_cuda_runtime() -> ctypes.CDLL:
 
 
 def get_ipc_offset(tensor: torch.Tensor) -> int:
-    """Byte offset of tensor.data_ptr() from the base of its cudaMalloc block."""
+    """Compute the byte offset of a CUDA tensor's data pointer from its cudaMalloc block base.
+
+    @param tensor: CUDA torch.Tensor.
+    @return: int byte offset.
+    @throws RuntimeError: if the CUDA driver call `cuMemGetAddressRange` fails.
+    @note: Tries `tensor.untyped_storage()._share_cuda_()` first; falls back
+        to a direct `cuMemGetAddressRange` driver call via ctypes.
+    """
     try:
         return tensor.untyped_storage()._share_cuda_()[3]
     except (RuntimeError, AttributeError):
@@ -90,8 +103,7 @@ def get_ipc_offset(tensor: torch.Tensor) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GaussianAttrBuffer:
-    """
-    Fixed-capacity contiguous CUDA float32 buffer holding all per-Gaussian
+    """Fixed-capacity contiguous CUDA float32 buffer holding all per-Gaussian
     attributes needed by the C++ rasterizer.
 
     Layout (each field occupies N_max rows; only rows [0, N_live) are valid):
@@ -103,14 +115,19 @@ class GaussianAttrBuffer:
                              [00,01,02,11,12,22] — the cov3D_precomp path,
                              matching render.py's compute_cov3D_python=True)
 
-    NOTE (wire v2 / magic "V42E"): the previous layout ended with
-    scale[3]+rot[4]; it is replaced by cov3D[6]. Sending the full covariance
-    (instead of scale + unit-quaternion) preserves the non-orthonormal
-    scale/shear that LBS blending puts into rotation_precomp, which a
-    quaternion would discard. This makes the VR splats identical to render.py.
+    @note: Wire v2 (magic "V42E") sends the full covariance instead of the
+        previous scale[3]+rot[4] tail, preserving the non-orthonormal
+        scale/shear that LBS blending puts into rotation_precomp (which a
+        quaternion would discard), so the VR splats match render.py.
     """
 
     def __init__(self, N_max: int, K: int, device: torch.device):
+        """Allocate the contiguous CUDA buffer and its per-field views.
+
+        @param N_max: buffer capacity in Gaussians.
+        @param K: per-Gaussian view-independent feature width.
+        @param device: CUDA torch device to allocate on.
+        """
         self.N_max  = N_max
         self.K      = K
         self.device = device
@@ -148,6 +165,15 @@ class GaussianAttrBuffer:
         )
 
     def write(self, xyz, feat, R_bwd, opacity, cov3D):
+        """Copy one frame's per-Gaussian attribute tensors into the buffer's leading rows.
+
+        @param xyz: [N, 3] CUDA tensor.
+        @param feat: [N, K] CUDA tensor.
+        @param R_bwd: [N, 9] CUDA tensor.
+        @param opacity: [N, 1] (or [N]) CUDA tensor.
+        @param cov3D: [N, 6] CUDA tensor.
+        @throws RuntimeError: if N exceeds `self.N_max`.
+        """
         N = xyz.shape[0]
         if N > self.N_max:
             raise RuntimeError(
@@ -166,7 +192,14 @@ class GaussianAttrBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GaussianIPCManager:
+    """Owns the CUDA IPC memory/event handles for one `GaussianAttrBuffer` and
+    signals frame readiness to the C++ viewer."""
+
     def __init__(self, attr_buf: GaussianAttrBuffer):
+        """@brief Create the IPC memory handle and the data-ready/read-complete event handles.
+        @param attr_buf: the GaussianAttrBuffer whose CUDA memory is shared.
+        @throws RuntimeError: if any underlying CUDA IPC call fails.
+        """
         self._cuda = load_cuda_runtime()
         self._buf  = attr_buf
         self.mem_handle = self._create_mem_handle()
@@ -175,6 +208,10 @@ class GaussianIPCManager:
         log.info("CUDA IPC handles created.")
 
     def _create_mem_handle(self) -> _IpcMem:
+        """@brief Create the CUDA IPC memory handle for the buffer's device pointer.
+        @return: _IpcMem handle.
+        @throws RuntimeError: if `cudaIpcGetMemHandle` fails.
+        """
         mh  = _IpcMem()
         ret = self._cuda.cudaIpcGetMemHandle(
             ctypes.byref(mh), ctypes.c_void_p(self._buf.ptr)
@@ -187,6 +224,10 @@ class GaussianIPCManager:
         return mh
 
     def _create_evt_handle(self):
+        """@brief Create an interprocess, non-timing CUDA event and its IPC handle.
+        @return: tuple `(_IpcEvt handle, ctypes.c_void_p event pointer)`.
+        @throws RuntimeError: if event creation or `cudaIpcGetEventHandle` fails.
+        """
         cudaEventInterprocess  = 0x04
         cudaEventDisableTiming = 0x02
         flags = cudaEventInterprocess | cudaEventDisableTiming
@@ -213,8 +254,10 @@ class GaussianIPCManager:
         return eh, evt_ptr
 
     def record_data_ready(self):
+        """@brief Synchronize the CUDA stream and record the data-ready IPC event."""
         torch.cuda.synchronize()
         self._cuda.cudaEventRecord(self._data_ready_evt_ptr, ctypes.c_void_p(0))
 
     def wait_read_complete(self):
+        """@brief Block until the C++ viewer signals it has finished reading this buffer."""
         self._cuda.cudaEventSynchronize(self._read_complete_evt_ptr)

@@ -1,24 +1,17 @@
 """
-render_vr_v1_modular.py  —  MISTA adapter for the reusable `vr_viewer` package.
+render_vr.py : MISTA pipeline wired with C++ VR Viewer, pose driven from dataset
 
-This is the *thin, pipeline-specific* half of the VR viewer. All CUDA-IPC
-transport, the wire protocol and the streaming loop live in the pipeline-agnostic
+All CUDA-IPC transport, the wire protocol and the streaming loop live in the 
 `vr_viewer/` package; this file supplies only what is unique to MISTA:
 
   * building the (factorized) scene and decoding the canonical avatar,
   * the view-independent feature extraction from MISTA Gaussians,
   * producing the five per-Gaussian attribute tensors for each animation frame.
 
-The generic Color-MLP TorchScript export lives in `vr_viewer.colormlp_export`
-(duck-typed, shared by the 3dgs-v2 / MISTA family). This file depends ONLY on
-`vr_viewer` and the MISTA codebase.
-
-To bring the viewer to another similar pipeline, copy this single file, swap the
-MISTA imports/helpers for that pipeline's equivalents, and reimplement
-`produce_frame`. The pipeline's own render.py / training code is never touched.
+The generic Color-MLP TorchScript export lives in `vr_viewer.colormlp_export`. 
 
 Wire v2 ("V42E"): the per-Gaussian tail is a precomputed 3D covariance
-(cov3D[6], upper triangle [00,01,02,11,12,22]) — the C++ rasterizer's
+(cov3D[6], upper triangle [00,01,02,11,12,22]), the C++ rasterizer's
 cov3D_precomp path, matching render.py (compute_cov3D_python=True).
 
 Usage (same CLI as render_vr_v1.py):
@@ -32,14 +25,10 @@ import logging
 
 import torch
 
-from utils.general_utils import build_rotation
-
 from vr_viewer import VRSource, run_server
 from vr_viewer.colormlp_export import export_color_mlp
-# vr_viewer privatised this helper when ColorMLPModule was added; this adapter
-# predates that refactor and only needs the dim calculation, not the wrapper.
 from vr_viewer.colormlp_export import _view_indep_feat_dim as view_indep_feat_dim
-
+from pipeline.mista_features import AXIS_FIX, deform_and_pack
 from render import build_scene
 
 logging.basicConfig(
@@ -52,90 +41,6 @@ log = logging.getLogger("mista_vr_v1_modular")
 _PORT  = 6012
 _N_MAX = 50_000   # IPC buffer capacity; must be >= actual Gaussian count.
 
-# Axis-convention correction for the predict-sequence source data (chest-to-back
-# depth comes out along world Y instead of Z). See render_vr_v4_2.py for the full
-# derivation. If the avatar renders upside down, negate row 1 (height/Y) entries.
-_AXIS_FIX = [[-0.9601507782936096,  0.15131592750549316, -0.2349766492843628],
-             [-0.27107205986976624, -0.29949113726615906,  0.914781391620636],
-             [ 0.06804757565259933,  0.9420236349105835,   0.32857415080070496]]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction — mirrors MISTA ColorMLP.compose_input (view-independent part).
-# These read MISTA's Gaussian data model directly, so they stay in the adapter
-# (not in the vr_viewer package).
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_view_indep_features(color_mlp, gaussians, camera) -> torch.Tensor:
-    features = gaussians.get_features.squeeze(-1)
-    if getattr(color_mlp, 'use_xyz', False):
-        aabb     = color_mlp.metadata["aabb"]
-        xyz_norm = aabb.normalize(gaussians.get_xyz, sym=True)
-        features = torch.cat([features, xyz_norm], dim=1)
-    if getattr(color_mlp, 'use_cov', False):
-        features = torch.cat([features, gaussians.get_covariance()], dim=1)
-    if getattr(color_mlp, 'use_normal', False):
-        scale  = gaussians._scaling
-        rot    = build_rotation(gaussians._rotation)
-        normal = torch.gather(rot, dim=2,
-            index=scale.argmin(1).reshape(-1, 1, 1).expand(-1, 3, 1)).squeeze(-1)
-        features = torch.cat([features, normal], dim=1)
-    if getattr(color_mlp, 'non_rigid_dim', 0) > 0:
-        features = torch.cat([features, gaussians.non_rigid_feature], dim=1)
-    return features   # [N, K]
-
-
-def extract_R_bwd(gaussians, cano_view_dir: bool, axis_fix: torch.Tensor) -> torch.Tensor:
-    """Per-Gaussian rotation applied to the SH view direction on the client.
-
-    The client builds `dir_pp = xyz - cam_center` from the xyz we send, which are
-    in the VR frame (p_vr = A p_world, `axis_fix` = A). But the texture was
-    trained with dir_pp in WORLD space — see models/texture/texture.py:107, which
-    uses gaussians.get_xyz and camera.camera_center directly, with no axis fix.
-
-    So we must undo A before the canonical rotation:
-        dir_cano = R_bwd (p - q)  =  R_bwd Aᵀ · A(p - q)  =  (R_bwd Aᵀ) dir_vr
-    i.e. the matrix we ship is R_bwd @ Aᵀ, not R_bwd. Without the Aᵀ the SH basis
-    is evaluated at a direction rotated by a large non-axis-aligned A, which
-    shifts hue on view-dependent surfaces (skin reads blue/cyan).
-    """
-    N   = gaussians.get_xyz.shape[0]
-    dev = gaussians.get_xyz.device
-    if cano_view_dir and hasattr(gaussians, 'fwd_transform'):
-        T_fwd = gaussians.fwd_transform
-        R_bwd = T_fwd[:, :3, :3].transpose(1, 2)          # world -> canonical
-    else:
-        R_bwd = torch.eye(3, dtype=torch.float32, device=dev).unsqueeze(0).expand(N, -1, -1)
-    R_bwd = torch.matmul(R_bwd, axis_fix.t())             # VR -> world -> canonical
-    return R_bwd.reshape(N, 9).contiguous()
-
-
-def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
-    """
-    Rotate a packed covariance into the VR frame.
-
-    `cov6` is [N, 6] in strip_symmetric order [00,01,02,11,12,22] (exactly what
-    gaussians.get_covariance() returns via the rotation_precomp path, matching
-    render.py). Points are mapped p -> A p by the axis fix, so the covariance
-    must transform Σ -> A Σ Aᵀ. We rebuild the full 3×3, rotate, and re-strip.
-    Doing it on the full matrix (not a quaternion) preserves the non-orthonormal
-    scale/shear that LBS blending puts into rotation_precomp.
-    """
-    N = cov6.shape[0]
-    Sig = cov6.new_zeros(N, 3, 3)
-    Sig[:, 0, 0] = cov6[:, 0]
-    Sig[:, 0, 1] = Sig[:, 1, 0] = cov6[:, 1]
-    Sig[:, 0, 2] = Sig[:, 2, 0] = cov6[:, 2]
-    Sig[:, 1, 1] = cov6[:, 3]
-    Sig[:, 1, 2] = Sig[:, 2, 1] = cov6[:, 4]
-    Sig[:, 2, 2] = cov6[:, 5]
-    Sig = A.unsqueeze(0) @ Sig @ A.t().unsqueeze(0)
-    out = cov6.new_empty(N, 6)
-    out[:, 0] = Sig[:, 0, 0]; out[:, 1] = Sig[:, 0, 1]; out[:, 2] = Sig[:, 0, 2]
-    out[:, 3] = Sig[:, 1, 1]; out[:, 4] = Sig[:, 1, 2]; out[:, 5] = Sig[:, 2, 2]
-    return out.contiguous()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MISTA checkpoint loading now lives in render.build_scene(), shared verbatim
 # with predict() and the other viewer adapters — it is imported below, not
@@ -144,6 +49,13 @@ def cov3D_in_vr_frame(cov6: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
 
 
 def collect_smpl_frames(dataset) -> list:
+    """Load every camera/pose entry from a dataset, dropping unneeded image data.
+
+    @param dataset: indexable, sized dataset whose items are camera objects with
+        a `.data` dict.
+    @return: list of camera objects, in dataset order, with `original_image` and
+        `original_mask` removed from `.data`.
+    """
     cams = []
     for i in range(len(dataset)):
         cam = dataset[i]
@@ -159,7 +71,22 @@ def collect_smpl_frames(dataset) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MistaVRSource(VRSource):
+    """VRSource implementation that drives a MISTA scene from a precomputed animation sequence."""
+
     def __init__(self, scene, smpl_cams, iteration, K, model_bytes, N_max):
+        """Store the decoded scene and animation cameras for use in `produce_frame`.
+
+        @param scene: MISTA scene object, already decoded (`scene.gaussians`
+            holds the canonical avatar).
+        @param smpl_cams: list of camera objects, one per animation frame.
+        @param iteration: training iteration passed to `pose_correction`/`deformer`.
+        @param K: view-independent feature dimension (unused directly; forwarded
+            to the VRSource handshake by the caller).
+        @param model_bytes: serialized Color-MLP TorchScript model (unused
+            directly; forwarded to the VRSource handshake by the caller).
+        @param N_max: IPC buffer capacity (unused directly; forwarded to the
+            VRSource handshake by the caller).
+        """
         self.scene       = scene
         self.converter   = scene.converter
         self.gaussians   = scene.gaussians          # canonical avatar (decoded from MIGS)
@@ -174,41 +101,30 @@ class MistaVRSource(VRSource):
         self.N_max       = N_max
         self.device      = next(self.color_mlp.parameters()).device
 
-        self.axis_fix       = torch.tensor(_AXIS_FIX, dtype=torch.float32, device=self.device)
+        self.axis_fix       = torch.tensor(AXIS_FIX, dtype=torch.float32, device=self.device)
         self.avatar_center0 = None                  # captured on frame 0 of each connection
 
     def on_connect(self):
-        # Re-pin the avatar start to world origin for each fresh viewer connection.
+        """Reset the cached avatar origin so it re-pins to world origin on the next frame."""
         self.avatar_center0 = None
 
     def produce_frame(self, frame_idx: int):
+        """Deform, place, and pack the canonical avatar for one animation frame.
+
+        @param frame_idx: frame counter; wrapped with `% self.n_frames` to index
+            into the animation loop.
+        @return: tuple `(xyz, feat, R_bwd_f, opacity, cov3D)` — the five
+            per-Gaussian attribute tensors sent to the C++/SIBR viewer.
+        @note: On `frame_idx == 0`, `avatar_center0` is captured from the current
+            frame's mean xyz and subtracted from all subsequent frames, and
+            placement/covariance diagnostics are logged.
+        """
         cam = self.smpl_cams[frame_idx % self.n_frames]
 
-        with torch.no_grad():
-            # ── Deformation ──────────────────────────────────────────────────
-            cam_c, _ = self.converter.pose_correction(cam, self.iteration)
-            deformed_pc, _ = self.converter.deformer(
-                self.gaussians, cam_c, self.iteration, compute_loss=False
-            )
-            torch.cuda.synchronize()
-
-            # ── View-independent feature extraction ──────────────────────────
-            feat    = extract_view_indep_features(self.color_mlp, deformed_pc, cam_c)
-            R_bwd_f = extract_R_bwd(deformed_pc, self.cano, self.axis_fix)
-
-            # ── Placement (axis fix + origin pin) ────────────────────────────
-            xyz = deformed_pc.get_xyz @ self.axis_fix.T
-            if self.avatar_center0 is None:
-                self.avatar_center0 = xyz.mean(dim=0, keepdim=True).clone()
-            xyz     = xyz - self.avatar_center0
-            opacity = deformed_pc.get_opacity.squeeze(-1)
-
-            # ── Posed covariance (cov3D_precomp path), rotated into VR frame ──
-            # get_covariance() uses rotation_precomp (posed, possibly non-orthonormal
-            # from LBS), matching render.py's compute_cov3D_python=True. We then apply
-            # the axis fix Σ -> A Σ Aᵀ so the splats sit in the same frame as xyz.
-            cov6  = deformed_pc.get_covariance()
-            cov3D = cov3D_in_vr_frame(cov6, self.axis_fix)
+        xyz, feat, R_bwd_f, opacity, cov3D, self.avatar_center0, deformed_pc = deform_and_pack(
+            self.converter, self.gaussians, self.color_mlp, self.cano, self.axis_fix,
+            cam, self.iteration, self.avatar_center0,
+        )
 
         if frame_idx == 0:
             lo = xyz.amin(dim=0).tolist()
@@ -251,6 +167,14 @@ import wandb
 
 @hydra.main(version_base=None, config_path="configs", config_name="config_5d")
 def main(config: DictConfig):
+    """Build the MISTA scene, decode the canonical avatar, and run the VR streaming server.
+
+    @param config: Hydra config (config_5d), mutated in place (struct mode
+        disabled; `exp_dir`, `mode`, and `suffix` are filled in if absent).
+    @note: Reads `config.gaussians_vr.n_max`/`.port` for IPC buffer capacity and
+        TCP port, falling back to `_N_MAX`/`_PORT`. Blocks until the server
+        (`run_server`) stops.
+    """
     OmegaConf.set_struct(config, False)
     config.dataset.preload = False
     config.exp_dir = config.get("exp_dir") or os.path.join("./exp", config.exp_name)

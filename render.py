@@ -43,12 +43,22 @@ def get_camera_folder_name(view):
     return "camera_unknown"
 
 def build_scene(config):
-    """
-    Load a factorized checkpoint (CP / Tucker / TT / MARS-wrapped TT /
-    tt5d_color_split) and build the Scene + GaussianModel from it.
+    """Load a factorized MIGS checkpoint and build the Scene + GaussianModel from it.
 
-    Shared by predict() and the VR/multiviewer wrapper scripts so that
-    checkpoint-loading behavior can't drift between entry points.
+    @param config: Hydra/OmegaConf config; must have `load_ckpt` set (checkpoint
+        path). Read/mutated: `config.migs.type` (normalized from the checkpoint's
+        `migs_type`, with legacy `"tt"` mapped to `"tt5d"`) and, for TT variants,
+        `config.migs.rank`.
+    @return: tuple `(scene, migs_type, appearance_id)` — the built `Scene`
+        (already in eval mode, with `scene.appearance_identity` set),
+        the resolved MIGS type string, and the appearance identity from
+        `config.appearance_identity` (may be None).
+    @throws ValueError: if `config.load_ckpt` is not set.
+    @note: Handles two checkpoint families: CP/Tucker (loaded via
+        `scene.load_checkpoint`) and TT / MARS-wrapped TT / tt5d_color_split
+        (cores allocated by shape inferred from the state dict, then loaded with
+        `strict=False`). Shared by `predict()` and the VR/webcam entry points so
+        checkpoint-loading behavior can't drift between them.
     """
     with torch.no_grad():
 

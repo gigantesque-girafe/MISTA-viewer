@@ -30,6 +30,14 @@ _CTRL_LEN = 8
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly `n` bytes from a socket, blocking until they arrive.
+
+    @param sock: connected socket.
+    @param n: number of bytes to read.
+    @return: bytes of length `n`.
+    @throws ConnectionError: if the peer closes the connection before `n`
+        bytes are received.
+    """
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -40,7 +48,16 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def do_handshake(conn, ipc_mgrs, attr_bufs, K, model_bytes):
-    """Startup handshake (identical wire format to render_vr_v4_2 / render_vr_v1)."""
+    """Perform the startup handshake with a connecting C++/SIBR viewer.
+
+    @param conn: connected socket.
+    @param ipc_mgrs: list of GaussianIPCManager, one per double-buffered slot.
+    @param attr_bufs: list of GaussianAttrBuffer, same length/order as `ipc_mgrs`.
+    @param K: per-Gaussian view-independent feature width, sent to the viewer.
+    @param model_bytes: serialized Color-MLP TorchScript blob, sent to the viewer.
+    @throws ValueError: if the received handshake magic does not match `HANDSHAKE`.
+    @throws ConnectionError: if the peer disconnects mid-handshake (via `recv_exact`).
+    """
     magic = recv_exact(conn, 4)
     if magic != HANDSHAKE:
         raise ValueError(f"Unexpected handshake magic: {magic!r} (expected {HANDSHAKE!r})")
@@ -64,10 +81,12 @@ def do_handshake(conn, ipc_mgrs, attr_bufs, K, model_bytes):
 def poll_control(conn) -> "list[tuple[bytes, int]]":
     """Non-blocking drain of pending client->server control messages.
 
-    Returns a list of (magic, payload) tuples. Does not disturb the outgoing frame
-    cadence: only reads when the socket already has data. A control message is 8
-    bytes (4-byte magic + int32); once the socket is readable we read the full
-    message (the viewer always sends complete packets).
+    @param conn: connected socket.
+    @return: list of `(magic, payload)` tuples, one per pending 8-byte control
+        message (4-byte magic + int32 payload), in arrival order. Empty if
+        none are pending.
+    @note: Only reads when the socket already has data (via `select`), so it
+        does not disturb the outgoing frame cadence.
     """
     out = []
     while True:

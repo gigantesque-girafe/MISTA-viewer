@@ -34,23 +34,14 @@ _LOG_INTERVAL = 60
 
 
 class VRSource:
-    """
-    Contract between a pipeline and the generic streaming loop.
+    """Contract between a pipeline and the generic streaming loop.
 
-    A subclass must set these attributes (typically in __init__ / setup):
+    A subclass must set these attributes (typically in `__init__`/setup):
         device       : torch.device   — CUDA device the attribute tensors live on
         N_max        : int            — IPC buffer capacity (>= max Gaussian count)
         K            : int            — per-Gaussian view-independent feature dim
         model_bytes  : bytes          — TorchScript Color-MLP blob sent at handshake
         n_frames     : int            — number of animation frames to cycle over
-
-    and implement:
-        produce_frame(frame_idx) -> (xyz, feat, R_bwd, opacity, cov3D)
-            All five are CUDA tensors ready to be copied into the IPC buffer.
-            cov3D is [N, 6] (posed covariance upper triangle) — the cov3D_precomp
-            path, matching render.py (compute_cov3D_python=True). `frame_idx` is
-            the raw monotonically-increasing counter; the source is responsible
-            for wrapping it (e.g. frame_idx % n_frames).
     """
 
     device: torch.device
@@ -65,15 +56,34 @@ class VRSource:
     pending_id = None
 
     def produce_frame(self, frame_idx: int):
+        """Produce one frame's per-Gaussian attribute tensors.
+
+        @param frame_idx: raw monotonically-increasing frame counter; the
+            subclass is responsible for wrapping it (e.g. `frame_idx % n_frames`).
+        @return: tuple `(xyz, feat, R_bwd, opacity, cov3D)`, all CUDA tensors
+            ready to be copied into the IPC buffer. `cov3D` is [N, 6] (posed
+            covariance upper triangle) — the cov3D_precomp path, matching
+            render.py (compute_cov3D_python=True).
+        """
         raise NotImplementedError
 
-    # Optional hook called once when a viewer connects, before the frame loop.
     def on_connect(self):
+        """@brief Optional hook called once when a viewer connects, before the frame loop. No-op by default."""
         pass
 
 
 def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30):
-    """Allocate IPC resources for `source` and serve the streaming loop forever."""
+    """Allocate double-buffered IPC resources for `source` and serve the streaming loop forever.
+
+    @param source: VRSource implementation supplying per-frame Gaussian attributes.
+    @param port: TCP port to listen on for the C++/SIBR viewer.
+    @param target_fps: target frame pacing; overridden by the `VR_PRODUCE_HZ`
+        env var if set (> 0).
+    @note: Runs until KeyboardInterrupt. Accepts and re-accepts connections in
+        a loop (a dropped connection does not stop the server). Honors two
+        diagnostic env vars: `VR_PRODUCE_HZ` (hard-cap producer rate) and
+        `VR_FREEZE_AFTER` (auto-pause after N frames, connection stays up).
+    """
     target_frame_seconds = 1.0 / target_fps
 
     # Diagnostics / fix knobs (env):

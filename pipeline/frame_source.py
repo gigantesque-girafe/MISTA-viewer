@@ -31,13 +31,21 @@ import cv2
 
 
 class FrameSource:
-    """Owns the cv2.VideoCapture and yields BGR frames.
+    """Owns the cv2.VideoCapture and yields BGR frames, in sequential or
+    realtime (latest-frame) capture mode; see module docstring.
 
-    `read()` returns the next frame, or raises KeyboardInterrupt at end of
-    stream / camera failure so the server loop unwinds cleanly.
+    @note: Exposes `realtime`, `dropped`, `grabbed`, `last_age_ms` for
+        instrumentation (see module docstring for meaning).
     """
 
     def __init__(self, args):
+        """Open the capture device and start the background grabber thread if realtime.
+
+        @param args: parsed CLI namespace; reads `source` ("webcam"/"video"),
+            `camera_index`, `video`, `realtime` ("auto"/"on"/"off"), and (webcam
+            realtime mode only) `camera_fps`, `camera_width`, `camera_height`.
+        @throws SystemExit: if the capture device fails to open.
+        """
         if args.source == "webcam":
             cap = cv2.VideoCapture(args.camera_index)
         else:
@@ -92,7 +100,12 @@ class FrameSource:
         self._thread.start()
 
     def _grab_loop(self):
-        """Continuously grab frames, keeping only the most recent one."""
+        """Background thread body: continuously grab frames, keeping only the most recent one.
+
+        @note: Runs until `release()` sets `self._stop`, or the device fails
+            (sets `self._eos`). Updates `self.grabbed` and notifies
+            `self._cond` on each successful grab.
+        """
         while True:
             ok, frame = self._cap.read()
             t = time.perf_counter()
@@ -110,6 +123,15 @@ class FrameSource:
                 self._cond.notify_all()
 
     def read(self):
+        """Return the next frame to process.
+
+        @return: np.ndarray, BGR frame. In sequential mode, the next frame in
+            order. In realtime mode, blocks until a frame newer than the last
+            one returned is available, updating `self.dropped` and
+            `self.last_age_ms`.
+        @throws KeyboardInterrupt: at end of stream or on camera failure, so
+            the server loop unwinds cleanly.
+        """
         if not self.realtime:
             ok, frame = self._cap.read()
             if not ok or frame is None:
@@ -128,6 +150,7 @@ class FrameSource:
             return self._latest
 
     def release(self):
+        """@brief Stop the grabber thread (if running) and release the capture device."""
         if self.realtime:
             with self._cond:
                 self._stop = True

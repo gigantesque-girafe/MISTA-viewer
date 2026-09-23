@@ -28,20 +28,23 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class _StageProfiler:
-    """Opt-in per-stage timer for estimate(), enabled by MISTA_PROFILE=1.
+    """Opt-in per-stage timer for `estimate()`, enabled by `MISTA_PROFILE=1`.
 
-    Purpose: settle whether mesh generation or the CNN backbone dominates a
-    backend's frame time. Each estimate() brackets its phases (preprocess /
-    forward / post) with `with prof.stage("forward"): ...`; we CUDA-synchronize
-    around each so GPU async work is attributed to the right phase rather than
-    bleeding into the next. A rolling mean (ms) per stage prints every
-    `report_every` frames. Disabled (the default) it is a no-op: stage() yields
-    immediately and adds no sync, so normal runs are unaffected.
+    @note: Each `estimate()` brackets its phases (preprocess/forward/post) with
+        `with prof.stage("forward"): ...`; CUDA-synchronizes around each so
+        async GPU work is attributed to the right phase. Disabled (the
+        default), `stage()` yields a no-op context with no sync, so normal runs
+        are unaffected.
     """
 
     _enabled = os.environ.get("MISTA_PROFILE", "") not in ("", "0", "false", "False")
 
     def __init__(self, label, report_every=60):
+        """@brief Initialize per-stage accumulators for a profiler labeled `label`.
+        @param label: string prefix for the printed report.
+        @param report_every: frames between printed reports; overridable via
+            the `MISTA_PROFILE_EVERY` env var.
+        """
         self._label = label
         self._every = int(os.environ.get("MISTA_PROFILE_EVERY", report_every))
         self._sums = {}
@@ -50,10 +53,13 @@ class _StageProfiler:
         self._cuda = torch.cuda.is_available()
 
     def _sync(self):
+        """@brief CUDA-synchronize if a CUDA device is available."""
         if self._cuda:
             torch.cuda.synchronize()
 
     class _Timer:
+        """Context manager that times one named stage and accumulates it into the profiler."""
+
         def __init__(self, prof, name):
             self._p, self._name = prof, name
 
@@ -73,12 +79,21 @@ class _StageProfiler:
             return False
 
     def stage(self, name):
+        """Return a timing context manager for a named stage.
+
+        @param name: stage label (e.g. "forward", "post").
+        @return: `_StageProfiler._Timer` if profiling is enabled, otherwise a
+            no-op context manager (`_NULL_CTX`).
+        """
         if not _StageProfiler._enabled:
             return _NULL_CTX
         return self._Timer(self, name)
 
     def tick(self):
-        """Call once per processed frame; prints a rolling mean every N frames."""
+        """Record one processed frame; prints a rolling per-stage mean every `report_every` frames.
+
+        @note: No-op if profiling is disabled.
+        """
         if not _StageProfiler._enabled:
             return
         self._n += 1
@@ -90,6 +105,8 @@ class _StageProfiler:
 
 
 class _NullCtx:
+    """No-op context manager used as `_StageProfiler.stage()`'s disabled-state return value."""
+
     def __enter__(self):
         return self
 
@@ -101,9 +118,13 @@ _NULL_CTX = _NullCtx()
 
 
 def _root_fix_matrix(spec):
-    """Parse a root-orientation-fix spec ('x-90','x90','x180','y90','z90','none') into
-    a 3x3 rotation matrix, or None to disable. Used to reconcile HybrIK's SMPL root
-    frame with the ROMP/ZJU frame the MISTA deformer expects."""
+    """Parse a root-orientation-fix spec into a 3x3 rotation matrix.
+
+    @param spec: string like `"x-90"`, `"x90"`, `"x180"`, `"y90"`, `"z90"`, or
+        `"none"`/falsy to disable.
+    @return: np.ndarray of shape (3, 3), float64, or None if `spec` is falsy,
+        `"none"`, names an axis other than x/y/z, or has a non-numeric angle.
+    """
     if not spec or spec.lower() == "none":
         return None
     axis = spec[0].lower()
@@ -123,12 +144,11 @@ def _root_fix_matrix(spec):
 
 
 def _rotmats_to_axis_angle(rotmats_np):
-    """(N,3,3) rotation matrices -> (N*3,) axis-angle vector.
+    """Convert a stack of rotation matrices to a flat axis-angle vector via cv2.Rodrigues.
 
-    Uses cv2.Rodrigues (already a dependency) per joint — robust and exact,
-    avoiding a hand-rolled rotmat->quat->axis-angle path. N is small (24 SMPL
-    joints), so the Python loop is negligible. Returns float32, laid out to match
-    the [root(3) | body(63) | hand(6)] SMPL axis-angle contract when N==24.
+    @param rotmats_np: np.ndarray of shape (N, 3, 3).
+    @return: np.ndarray of shape (N*3,), float32. When N==24, laid out to match
+        the [root(3) | body(63) | hand(6)] SMPL axis-angle contract.
     """
     n = rotmats_np.shape[0]
     aa = np.empty((n, 3), dtype=np.float32)
@@ -139,39 +159,44 @@ def _rotmats_to_axis_angle(rotmats_np):
 
 
 class PoseEstimator(ABC):
-    """Backend-agnostic single-person SMPL pose estimator.
+    """Backend-agnostic single-person SMPL pose estimator interface.
 
-    Contract: given a BGR frame (np.ndarray, HxWx3), return a tuple
-    `(pose, trans)` where `pose` is a (72,) float32 axis-angle vector
-    [root(3) | body(63) | hand(6)] and `trans` is a (3,) float32 world
-    translation (or None if the backend does not provide one). On no
-    detection, return `(None, None)`.
-
-    Side channels (set every estimate(), like `last_pj2d`): `last_betas` holds
-    the current person's SMPL shape vector ((10,) float32) or None. The (pose,
-    trans) return tuple is unchanged; consumers that want shape read the
-    attribute. Used by the proportion retarget to build the actor's rest
-    skeleton (see pipeline/retarget.py:source_jtr_from_betas).
+    @note: Implementations also set `last_betas` (the current person's (10,)
+        float32 SMPL shape vector, or None) as a side channel on every
+        `estimate()` call, read by the proportion retarget to build the
+        actor's rest skeleton (see `pipeline/retarget.py:source_jtr_from_betas`).
     """
 
     @abstractmethod
     def estimate(self, frame_bgr):
-        """(np.ndarray (72,) float32 axis-angle, np.ndarray (3,)|None), or (None, None)."""
+        """Estimate the SMPL pose of the single person in a frame.
+
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: tuple `(pose, trans)` — `pose` is a (72,) float32 axis-angle
+            vector [root(3) | body(63) | hand(6)], `trans` is a (3,) float32
+            world translation or None if the backend does not provide one. On
+            no detection, returns `(None, None)`.
+        """
         raise NotImplementedError
 
     @property
     def name(self) -> str:
+        """@brief Return this estimator's display name (defaults to the class name)."""
         return type(self).__name__
 
 
 class RompEstimator(PoseEstimator):
-    """Adapts romp.ROMP -> PoseEstimator. ROMP's output is already axis-angle."""
+    """PoseEstimator adapter over `romp.ROMP`; its output is already axis-angle."""
 
     # ROMP's pj2d_org first 24 rows ARE the SMPL-kinematic joints (its own code slices
     # [:24] as the SMPL joints), so the 2D row index equals the SMPL joint index.
     PJ2D_SMPL_MAP = [(i, i) for i in range(24)]
 
     def __init__(self, romp_model, name="ROMP"):
+        """@brief Wrap a constructed `romp.ROMP` model.
+        @param romp_model: constructed `romp.ROMP` instance.
+        @param name: display name (see `name` property).
+        """
         self._model = romp_model
         self._name = name
         # Latest person's 2D SMPL joints in ORIGINAL image pixels (J,2), or None on
@@ -187,9 +212,18 @@ class RompEstimator(PoseEstimator):
 
     @property
     def name(self):
+        """@brief Return the display name given at construction."""
         return self._name
 
     def estimate(self, frame_bgr):
+        """Run ROMP on one frame and extract the single-person pose, translation, and side channels.
+
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: tuple `(pose, trans)` per the `PoseEstimator.estimate` contract.
+        @note: Also sets `self.last_pj2d` (person's 2D SMPL joints in original
+            image pixels, or None) and `self.last_betas` (person's (10,) SMPL
+            shape vector, or None) as side channels.
+        """
         with self._prof.stage("forward"):
             with torch.no_grad():
                 out = self._model(frame_bgr)
@@ -217,14 +251,18 @@ class RompEstimator(PoseEstimator):
 
     @classmethod
     def from_args(cls, args):
-        """Construct a RompEstimator with the ONNX/CUDA/TensorRT backend selected by args.
+        """Construct a RompEstimator with the ONNX/CUDA/TensorRT backend selected by `args`.
 
-        ONNX-GPU is ROMP's real-time path; TensorRT (--trt) routes that SAME ONNX
-        graph through onnxruntime's TensorRT execution provider for a clean A/B. We
-        set the providers EXPLICITLY after construction (ROMP hardcodes
-        [TRT, CUDA, CPU] in romp/main.py) so the non-TRT baseline is pure CUDA and
-        the TRT path carries FP16 + a persistent engine cache. We never fall back to
-        the CPU-ONNX provider (slower than ROMP's PyTorch backbone).
+        @param args: parsed CLI namespace; reads `onnx`, `trt`, `trt_fp16`,
+            `trt_cache_dir`, `trt_lib_dir`.
+        @return: RompEstimator instance, named `"ROMP-TRT"` if the TensorRT EP
+            actually loaded, otherwise `"ROMP"`.
+        @note: Falls back progressively: missing onnxruntime disables ONNX/TRT;
+            a missing TensorRT EP disables TRT; a missing CUDA EP disables
+            ONNX/TRT entirely (never falls back to the CPU-ONNX provider,
+            which is slower than ROMP's PyTorch backbone). The active provider
+            is read from the constructed session, not the requested list, so a
+            silent TRT-to-CUDA fallback is correctly reported.
         """
         import romp  # lazy: only needed for the ROMP backend
 
@@ -312,18 +350,25 @@ class RompEstimator(PoseEstimator):
 
 
 class BevEstimator(PoseEstimator):
-    """Adapts bev.BEV -> PoseEstimator. BEV is ROMP's depth-reasoning successor; its
-    output dict uses the SAME keys as ROMP (smpl_thetas/cam_trans/smpl_betas/pj2d_org),
-    so this mirrors RompEstimator. Two BEV-specific differences: smpl_betas is 11-d
-    (SMPL-A: 10 shape + 1 kid/age offset), sliced to (10,) for the contract; and BEV
-    returns batched multi-person arrays, so we index person 0 (--show_largest keeps it
-    to the largest subject)."""
+    """PoseEstimator adapter over `bev.BEV` (ROMP's depth-reasoning successor).
+
+    @note: Its output dict uses the same keys as ROMP
+        (smpl_thetas/cam_trans/smpl_betas/pj2d_org). Two differences from
+        RompEstimator: `smpl_betas` is 11-d (SMPL-A: 10 shape + 1 kid/age
+        offset), sliced to (10,) here; and person 0 is indexed from BEV's
+        batched multi-person arrays (`--show_largest` keeps it the largest
+        subject).
+    """
 
     # BEV projects the SMPL-kinematic joints (its pj2d_org rows), first 24 = SMPL joint
     # index, same convention as ROMP -> identity map for PnP alignment.
     PJ2D_SMPL_MAP = [(i, i) for i in range(24)]
 
     def __init__(self, bev_model, name="BEV"):
+        """@brief Wrap a constructed `bev.BEV` model.
+        @param bev_model: constructed `bev.BEV` instance.
+        @param name: display name (see `name` property).
+        """
         self._model = bev_model
         self._name = name
         self.last_pj2d = None
@@ -333,9 +378,17 @@ class BevEstimator(PoseEstimator):
 
     @property
     def name(self):
+        """@brief Return the display name given at construction."""
         return self._name
 
     def estimate(self, frame_bgr):
+        """Run BEV on one frame and extract the single-person pose, translation, and side channels.
+
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: tuple `(pose, trans)` per the `PoseEstimator.estimate` contract.
+        @note: Also sets `self.last_pj2d` and `self.last_betas` (11-d SMPL-A
+            betas sliced to (10,)) as side channels; see `RompEstimator.estimate`.
+        """
         with self._prof.stage("forward"):
             with torch.no_grad():
                 out = self._model(frame_bgr)
@@ -366,32 +419,22 @@ class BevEstimator(PoseEstimator):
     def from_args(cls, args):
         """Construct a BevEstimator (PyTorch backend; backbone optionally ONNX/TensorRT).
 
-        BEV shares ROMP's ~/.romp model directory. BEV.pth and SMPLA_NEUTRAL.pth are
-        the real BEV weights (auto-downloaded / already present).
-
-        SMIL (BEV's baby body model) is the one gap: it is NOT in the public ROMP release
-        (its download is commented out in bev_settings) and requires manual registration
-        with the SMIL project + packing via `bev.prepare_smil`. But SMPLA_parser only ever
-        *invokes* the SMIL model for detections flagged as babies (betas[..,10] kid offset);
-        for adult subjects -- the MISTA webcam/video use case -- it is constructed but never
-        called. So when smil_packed_info.pth is absent we point smil_path at the standard
-        SMPL_NEUTRAL.pth already in ~/.romp (same packed format, model_type='smpl'), which
-        lets BEV construct and run with identical adult output. If a real SMIL file is
-        present it is used as-is.
-
-        BEV's rendering/vis stack (Sim3DR_Cython, vis_human) pulls in a second OpenMP
-        runtime alongside torch's libiomp5md, which hard-aborts the process on Windows
-        (native exit 0xC06D007F) unless duplicates are allowed -- same guard the PARE and
-        HybrIK backends use. We also pass --render_mesh (a store_false flag: presence turns
-        OFF mesh rendering) so BEV skips the per-frame vertex render we never consume; the
-        2D joint projection (pj2d_org, used by --align) is gated by --calc_smpl, not
-        --render_mesh, so it is still produced.
-
-        --trt/--onnx accelerate BEV's HRNet backbone via onnxruntime (TensorRT/CUDA EP),
-        the same stack ROMP's --trt uses; the dynamic heads stay in PyTorch.
+        @param args: parsed CLI namespace; reads `onnx`, `trt`, `trt_fp16`,
+            `trt_cache_dir`, `trt_lib_dir` (forwarded to `_accelerate_bev_backbone`).
+        @return: BevEstimator instance, named per `_accelerate_bev_backbone`'s
+            returned label ("BEV" / "BEV-ONNX" / "BEV-TRT").
+        @throws FileNotFoundError: if BEV's SMIL model is missing and no
+            `SMPL_NEUTRAL.pth` fallback is found under `~/.romp`.
+        @note: When SMIL (BEV's baby body model) is absent — it ships outside
+            the public ROMP release — substitutes `SMPL_NEUTRAL.pth` as a
+            same-format stand-in, valid because SMIL is only invoked for
+            detections flagged as babies and the MISTA use case is adults.
+            Sets `KMP_DUPLICATE_LIB_OK=TRUE` (BEV's vis stack pulls in a second
+            OpenMP runtime that otherwise aborts the process on Windows) and
+            passes `--render_mesh` to skip unused per-frame mesh rendering.
         """
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-        import bev  # lazy: only needed for the BEV backend
+        import bev 
 
         settings = bev.bev_settings(
             input_args=["--GPU", "0", "--show_largest", "--calc_smpl", "--render_mesh"])
@@ -418,21 +461,16 @@ class BevEstimator(PoseEstimator):
 
 
 class PareEstimator(PoseEstimator):
-    """Adapts a PARE model -> PoseEstimator.
+    """PoseEstimator adapter over a PARE model, using a full-frame square bbox
+    crop (no separate person detector; assumes a single subject roughly filling
+    the frame).
 
-    Uses a full-frame square bbox (single-user webcam / video: the subject is
-    assumed to roughly fill the frame, so we skip a separate person detector).
-    PARE's forward returns `pred_pose` as rotation matrices (1,24,3,3); we
-    convert to (72,) axis-angle with PARE's own geometry utility to match the
-    axis-angle SMPL pose ROMP produces.
-
-    The crop + ImageNet normalization is inlined here (equivalent to PARE's
-    get_single_image_crop_demo with rot=0/no-flip) so we depend only on
-    pare.utils.geometry -- NOT pare.utils.vibe_image_utils, which imports
-    scikit-image at module load (a helper we never use, and which crashes on
-    import in this environment). We also convert BGR->RGB, which the ndarray
-    path of get_single_image_crop_demo does NOT do but the ImageNet mean/std
-    require (PARE's demo converts before calling it).
+    @note: PARE's forward returns `pred_pose` as rotation matrices (1,24,3,3),
+        converted here to (72,) axis-angle via PARE's own geometry utility to
+        match ROMP's convention. The crop + ImageNet normalization is inlined
+        (equivalent to PARE's `get_single_image_crop_demo` with rot=0/no-flip)
+        to avoid depending on `pare.utils.vibe_image_utils`, which imports
+        scikit-image at module load and crashes on import in this environment.
     """
 
     # ImageNet normalization (matches PARE get_default_transform).
@@ -450,6 +488,12 @@ class PareEstimator(PoseEstimator):
     ]
 
     def __init__(self, model, device, crop_size=224, scale=1.0):
+        """@brief Wrap a constructed PARE model.
+        @param model: constructed PARE nn.Module, in eval mode.
+        @param device: torch device to run inference and build tensors on.
+        @param crop_size: side length (px) of the square crop fed to the model.
+        @param scale: bbox scale factor applied to the full-frame square crop.
+        """
         self._model = model
         self._device = device
         self._crop_size = int(crop_size)
@@ -469,13 +513,19 @@ class PareEstimator(PoseEstimator):
 
     @property
     def name(self):
+        """@brief Return "PARE"."""
         return "PARE"
 
     def _crop_and_normalize(self, frame_bgr):
-        """Full-frame square crop -> crop_size, ImageNet-normalized (3,H,W) tensor.
+        """Build the ImageNet-normalized input tensor from a full-frame square crop.
 
-        Reproduces PARE's generate_patch_image_cv (rot=0, no flip) + ToTensor +
-        Normalize for a bbox centered on the frame covering max(w,h)*scale.
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: torch.Tensor of shape (3, crop_size, crop_size), float,
+            ImageNet-normalized, on `self._device`.
+        @note: Reproduces PARE's `generate_patch_image_cv` (rot=0, no flip) +
+            ToTensor + Normalize, for a bbox centered on the frame covering
+            `max(w, h) * self._scale`. Also stores the original->crop affine in
+            `self._last_crop_trans` for `_joints2d_to_original`.
         """
         img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
@@ -494,11 +544,15 @@ class PareEstimator(PoseEstimator):
         return (t - self._mean) / self._std
 
     def _joints2d_to_original(self, joints2d_norm):
-        """PARE's normalized crop joints (J,2) -> ORIGINAL-image pixels (J,2).
+        """Map PARE's normalized crop-space joints back to original-image pixels.
 
-        PARE projects with camera_center=0 (crop-centered) and normalizes by
-        img_res/2 (smpl_head.py), so a crop pixel is `j*(crop/2) + crop/2`. We then
-        invert the original->crop affine we used to build the input patch.
+        @param joints2d_norm: np.ndarray of shape (J, 2), normalized crop-space
+            joints (camera_center=0, normalized by img_res/2 per PARE's
+            smpl_head.py).
+        @return: np.ndarray of shape (J, 2), float32, original-image pixel
+            coordinates.
+        @note: Requires `self._last_crop_trans` to have been set by a prior
+            `_crop_and_normalize` call.
         """
         half = self._crop_size / 2.0
         crop_px = joints2d_norm * half + half                    # (J,2) in crop pixels
@@ -506,6 +560,16 @@ class PareEstimator(PoseEstimator):
         return (crop_px @ inv[:, :2].T + inv[:, 2]).astype(np.float32)
 
     def estimate(self, frame_bgr):
+        """Run PARE on one frame and extract the pose and side channels.
+
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: tuple `(pose, None)` — `pose` is a (72,) float32 axis-angle
+            vector; translation is always None (PARE's demo path exposes no
+            consistent world translation, so root motion is disabled for this
+            backend).
+        @note: Also sets `self.last_pj2d` (original-image pixel joints, or
+            None) and `self.last_betas` ((10,) SMPL shape vector, or None).
+        """
         with self._prof.stage("preprocess"):
             inp = self._crop_and_normalize(frame_bgr).unsqueeze(0)   # (1,3,H,W)
         with self._prof.stage("forward"):
@@ -534,10 +598,17 @@ class PareEstimator(PoseEstimator):
     def from_config(cls, pare_cfg, pare_ckpt, device, crop_size=224, scale=1.0):
         """Instantiate the PARE network from its config + checkpoint, in eval mode.
 
-        Mirrors PARETester._build_model + _load_pretrained_model (pare/core/tester.py)
-        but without the multi-person tracker / video pipeline: we only need the raw
-        network forward on a pre-cropped frame. (--onnx/--no-onnx are ROMP-only and
-        simply don't apply here.)
+        @param pare_cfg: path to PARE's hparams YAML config.
+        @param pare_ckpt: path to the PARE Lightning checkpoint (.ckpt).
+        @param device: torch device to build the model on.
+        @param crop_size: forwarded to `PareEstimator.__init__`.
+        @param scale: forwarded to `PareEstimator.__init__`.
+        @return: PareEstimator instance wrapping the constructed model.
+        @note: Mirrors `PARETester._build_model` + `_load_pretrained_model`
+            (pare/core/tester.py) without the multi-person tracker/video
+            pipeline. Sets `KMP_DUPLICATE_LIB_OK=TRUE` (see `BevEstimator.from_args`)
+            and temporarily chdirs into the vendored PARE submodule so its
+            CWD-relative body-model paths resolve.
         """
         if "--onnx" in sys.argv or "--no-onnx" in sys.argv:
             print("[INIT] --onnx/--no-onnx only apply to the ROMP backend; ignored for PARE.")
@@ -591,7 +662,12 @@ class PareEstimator(PoseEstimator):
 
     @staticmethod
     def _construct(PARE, hparams, device):
-        """Instantiate the PARE nn.Module from hparams (split out for readability)."""
+        """@brief Instantiate the PARE nn.Module from `hparams` on `device`.
+        @param PARE: the PARE model class.
+        @param hparams: PARE hyperparameter config (from `update_hparams`).
+        @param device: torch device to build the model on.
+        @return: constructed `PARE` nn.Module (not yet loaded with weights).
+        """
         return PARE(
             backbone=hparams.PARE.BACKBONE,
             num_joints=hparams.PARE.NUM_JOINTS,
@@ -632,20 +708,17 @@ class PareEstimator(PoseEstimator):
 
 
 class HybrIKEstimator(PoseEstimator):
-    """Adapts a HybrIK model -> PoseEstimator.
+    """PoseEstimator adapter over a HybrIK model (analytical-neural IK, regresses
+    SMPL parameters directly).
 
-    HybrIK (analytical-neural IK) regresses SMPL parameters directly, so it fits
-    the same (72,) axis-angle contract as ROMP/PARE. Its forward returns
-    `pred_theta_mats` as SMPL joint rotation matrices (1, 24*9); we reshape to
-    (24,3,3) and convert to (72,) axis-angle (via cv2.Rodrigues) to match ROMP.
-
-    Detection strategy: full-frame bbox (no separate person detector), mirroring
-    the PARE backend's assumption that the single subject roughly fills the frame.
-    This keeps HybrIK light enough for the RTX 1080 when paired with the ResNet-34
-    backbone config. A real detector (Faster R-CNN, per HybrIK's demo) can be added
-    later behind a flag. We reuse HybrIK's own `SimpleTransform3DSMPLCam.test_transform`
-    for preprocessing rather than reinventing its bbox/camera normalization, which
-    the IK head depends on.
+    @note: Its forward returns `pred_theta_mats` as SMPL joint rotation
+        matrices (1, 24*9), reshaped to (24,3,3) and converted to (72,)
+        axis-angle via cv2.Rodrigues to match ROMP's contract. Detection uses a
+        bbox tracked frame-to-frame from the previous frame's predicted 2D
+        joints (full-frame only on cold start), rather than a separate person
+        detector — HybrIK's IK/camera regression is sensitive to a tight crop.
+        Preprocessing reuses HybrIK's own
+        `SimpleTransform3DSMPLCam.test_transform`.
     """
 
     # HybrIK's pred_uvd_jts / pred_theta_mats use a 29-joint SMPL layout whose first
@@ -653,6 +726,11 @@ class HybrIKEstimator(PoseEstimator):
     PJ2D_SMPL_MAP = [(i, i) for i in range(24)]
 
     def __init__(self, model, transform, device):
+        """@brief Wrap a constructed HybrIK model and its preprocessing transform.
+        @param model: constructed HybrIK SPPE nn.Module, in eval mode.
+        @param transform: HybrIK `SimpleTransform3DSMPLCam` preprocessing transform.
+        @param device: torch device to run inference and build tensors on.
+        """
         self._model = model
         self._transform = transform
         self._device = device
@@ -671,13 +749,22 @@ class HybrIKEstimator(PoseEstimator):
 
     @property
     def name(self):
+        """@brief Return "HybrIK"."""
         return "HybrIK"
 
     @staticmethod
     def _bbox_from_pts(pts, w, h, pad=0.3):
-        """Tight square xyxy bbox around 2D joints `pts` (J,2), padded, clamped to
-        the image. Returns None if the points are degenerate (so the caller resets
-        to a full-frame crop rather than tracking a collapsed box)."""
+        """Compute a tight, padded square xyxy bbox around 2D joints.
+
+        @param pts: np.ndarray of shape (J, 2), 2D joint pixel coordinates.
+        @param w: image width, used to reject an implausibly large box.
+        @param h: image height, used to reject an implausibly large box.
+        @param pad: fractional padding added to the tight bbox side length.
+        @return: np.ndarray of shape (4,), float32, `[x0, y0, x1, y1]`; or None
+            if the points are degenerate (non-finite, side < 8px, or side >
+            4x max(w, h)) so the caller resets to a full-frame crop instead of
+            tracking a collapsed box.
+        """
         x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
         x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
         side = max(x1 - x0, y1 - y0) * (1.0 + pad)
@@ -688,6 +775,22 @@ class HybrIKEstimator(PoseEstimator):
                          cx + side / 2, cy + side / 2], dtype=np.float32)
 
     def estimate(self, frame_bgr):
+        """Run HybrIK on one frame and extract the pose, world translation, and side channels.
+
+        @param frame_bgr: np.ndarray, HxWx3, BGR.
+        @return: tuple `(pose, transl)` — `pose` is a (72,) float32 axis-angle
+            vector; `transl` is a (3,) float32 world translation (HybrIK's
+            `transl`, in ROMP's cam_trans convention) or None if the model
+            provides none.
+        @note: Also sets `self.last_pj2d` (original-image pixel joints) and
+            `self.last_betas` ((10,) SMPL shape vector). Retightens
+            `self._bbox` from the predicted joints for the next frame's crop,
+            resetting to full-frame if the joints degenerate. An optional root
+            rotation fix (`MISTA_HYBRIK_ROOTFIX` env var; default "none") can
+            be applied to reconcile HybrIK's root frame with ROMP/ZJU's. On
+            the first call, writes a one-shot diagnostic dump to
+            `hybrik_dbg.txt` under the repo root.
+        """
         with self._prof.stage("preprocess"):
             img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             h, w = img.shape[:2]
@@ -784,10 +887,17 @@ class HybrIKEstimator(PoseEstimator):
     def from_config(cls, hybrik_cfg, hybrik_ckpt, device):
         """Instantiate the HybrIK network + its preprocessing transform, in eval mode.
 
-        Mirrors HybrIK's scripts/demo_video.py setup (builder.build_sppe + the
-        SimpleTransform3DSMPLCam test transform) minus the Faster R-CNN detector and
-        the video/tracking loop: we only need the raw network forward on a full-frame
-        crop.
+        @param hybrik_cfg: path to HybrIK's model config YAML.
+        @param hybrik_ckpt: path to the HybrIK checkpoint (.pth).
+        @param device: torch device to build the model on.
+        @return: HybrIKEstimator instance wrapping the constructed model and transform.
+        @note: Mirrors HybrIK's `scripts/demo_video.py` setup
+            (`builder.build_sppe` + the `SimpleTransform3DSMPLCam` test
+            transform) minus the Faster R-CNN detector and video/tracking
+            loop. Sets `KMP_DUPLICATE_LIB_OK=TRUE`, temporarily chdirs into the
+            vendored HybrIK submodule for its CWD-relative model paths, and
+            falls back to a bundled pytorch3d rotation-conversion shim if
+            pytorch3d is not installed.
         """
         # HybrIK's stack (like PARE's) can pull in a second OpenMP runtime; allow the
         # duplicate on Windows unless the user already chose a value. --onnx/--trt are
@@ -881,11 +991,13 @@ class HybrIKEstimator(PoseEstimator):
 
 
 def _prepend_trt_dll_path(trt_lib_dir):
-    """Prepend the TensorRT lib dir (+ torch/lib for cuDNN) to the process PATH.
+    """Prepend the TensorRT lib dir and torch's cuDNN lib dir to the process PATH.
 
-    onnxruntime's TensorRT provider loads its dependent DLLs through the PATH
-    search order, so this must run before `import onnxruntime`. torch/lib supplies
-    cuDNN 8 (and cuBLAS/cudart) that TensorRT needs.
+    @param trt_lib_dir: path to the TensorRT lib directory, or None/nonexistent
+        (logs a warning and is skipped).
+    @note: Must run before `import onnxruntime`, since onnxruntime's TensorRT
+        provider resolves its dependent DLLs through the process PATH search
+        order. torch/lib supplies cuDNN 8 (and cuBLAS/cudart) that TensorRT needs.
     """
     parts = []
     if trt_lib_dir and os.path.isdir(trt_lib_dir):
@@ -908,19 +1020,22 @@ def _prepend_trt_dll_path(trt_lib_dir):
 
 
 class _OrtBackbone(torch.nn.Module):
-    """Drop-in replacement for BEV's HRNet backbone that runs an ONNX graph through
-    onnxruntime (CUDA or TensorRT EP) instead of PyTorch.
+    """Drop-in nn.Module replacement for BEV's HRNet backbone, running the
+    exported ONNX graph through an onnxruntime session (CUDA or TensorRT EP)
+    instead of PyTorch.
 
-    BEVv1.forward does `x = self.backbone(x)` and feeds that single feature map to
-    both the localization and param heads (bev/model.py:233-245). The backbone is a
-    pure static-shape CNN -- input NHWC (1,512,512,3) from romp.img_preprocess, output
-    (1,32,128,128) -- so it exports cleanly to ONNX and is the heavy part worth
-    accelerating. We keep the rest of BEV (dynamic center parsing, 3D transformer,
-    SMPL-A parser) in PyTorch. I/O crosses the GPU<->host boundary as numpy; the
-    copies (~3MB in, ~2MB out) are negligible next to the conv backbone cost.
+    @note: Static input/output shapes only: input NHWC (1,512,512,3), output
+        (1,32,128,128) (bev/model.py:233-245). I/O crosses the GPU<->host
+        boundary as numpy.
     """
 
     def __init__(self, session, device, input_name, output_name):
+        """@brief Wrap an onnxruntime InferenceSession as a torch backbone.
+        @param session: onnxruntime.InferenceSession running the exported backbone.
+        @param device: torch device the output tensor is moved to.
+        @param input_name: name of the session's input tensor.
+        @param output_name: name of the session's output tensor.
+        """
         super().__init__()
         self._sess = session
         self._device = device
@@ -928,18 +1043,31 @@ class _OrtBackbone(torch.nn.Module):
         self._out = output_name
 
     def forward(self, x):
+        """@brief Run the ONNX session on `x` and return the feature map on `self._device`.
+        @param x: torch.Tensor, NHWC (1, 512, 512, 3).
+        @return: torch.Tensor, (1, 32, 128, 128), on `self._device`.
+        """
         feats = self._sess.run([self._out],
                                {self._in: x.detach().cpu().numpy().astype(np.float32)})[0]
         return torch.from_numpy(feats).to(self._device)
 
 
 def _bev_backbone_onnx_path(settings):
-    """Cache the exported backbone next to BEV.pth (~/.romp/BEV_backbone.onnx)."""
+    """@brief Return the cache path for the exported BEV backbone (next to BEV.pth).
+    @param settings: BEV settings object; `settings.model_path` locates the BEV weights dir.
+    @return: path string, `<dirname(model_path)>/BEV_backbone.onnx`.
+    """
     return os.path.join(os.path.dirname(settings.model_path), "BEV_backbone.onnx")
 
 
 def _export_bev_backbone_onnx(backbone, onnx_path):
-    """Export the HRNet backbone to a static-shape ONNX graph (once; cached)."""
+    """Export BEV's HRNet backbone to a static-shape ONNX graph.
+
+    @param backbone: BEV's HRNet backbone nn.Module.
+    @param onnx_path: destination path for the exported ONNX file.
+    @note: Uses a dummy NHWC (1, 512, 512, 3) input, matching
+        `romp.img_preprocess`'s output layout.
+    """
     device = next(backbone.parameters()).device
     # img_preprocess yields NHWC (1,512,512,3); the backbone permutes internally.
     dummy = torch.zeros(1, 512, 512, 3, dtype=torch.float32, device=device)
@@ -952,13 +1080,15 @@ def _export_bev_backbone_onnx(backbone, onnx_path):
 
 
 def _accelerate_bev_backbone(model, args):
-    """Splice an onnxruntime (TensorRT/CUDA EP) backbone into a constructed BEV.
+    """Splice an onnxruntime (TensorRT/CUDA EP) backbone into a constructed BEV model.
 
-    Reuses the SAME TRT plumbing as the ROMP path (_prepend_trt_dll_path + the
-    ORT_TENSORRT_* env + an explicit provider list) so `--estimator bev --trt
-    --trt-fp16 --trt-lib-dir ...` behaves like ROMP's --trt. Returns a backend label
-    ('BEV-TRT' / 'BEV-ONNX' / 'BEV'). Any failure falls back to the PyTorch backbone
-    so BEV still runs.
+    @param model: constructed `bev.BEV` instance whose backbone may be replaced in place.
+    @param args: parsed CLI namespace; reads `onnx`, `trt`, `trt_fp16`,
+        `trt_cache_dir`, `trt_lib_dir`.
+    @return: backend label string, one of `"BEV"`, `"BEV-ONNX"`, `"BEV-TRT"`.
+    @note: Reuses the same TensorRT plumbing as `RompEstimator.from_args`. Any
+        failure (missing onnxruntime, missing TensorRT/CUDA EP) falls back to
+        the PyTorch backbone rather than raising, so BEV still runs.
     """
     use_onnx = bool(getattr(args, "onnx", False))
     use_trt = bool(getattr(args, "trt", False))
@@ -1024,10 +1154,14 @@ def _accelerate_bev_backbone(model, args):
 
 
 def build_estimator(args, device) -> PoseEstimator:
-    """Factory: construct the selected PoseEstimator backend. Keeps main() and the
-    source class free of any backend-specific imports/branching. Each backend's
-    construction (imports, OpenMP guard, ONNX/TensorRT setup, logging) lives in its
-    own class's from_args/from_config classmethod; this dispatcher just selects one."""
+    """Construct the PoseEstimator backend selected by `args.estimator`.
+
+    @param args: parsed CLI namespace; `args.estimator` selects "romp", "bev",
+        "hybrik", or (default) "pare", with the rest forwarded to that
+        backend's `from_args`/`from_config` classmethod.
+    @param device: torch device passed to the HybrIK/PARE constructors.
+    @return: a PoseEstimator instance of the selected backend.
+    """
     if args.estimator == "romp":
         return RompEstimator.from_args(args)
     if args.estimator == "bev":

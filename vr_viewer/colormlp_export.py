@@ -35,6 +35,13 @@ __all__ = ["ColorMLPModule", "export_color_mlp"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sh_bases(deg: int, dirs: torch.Tensor) -> torch.Tensor:
+    """Evaluate real spherical-harmonic basis functions up to degree `deg` at `dirs`.
+
+    @param deg: SH degree, 0-3.
+    @param dirs: torch.Tensor of shape [N, 3], unit view directions.
+    @return: torch.Tensor of shape [N, (deg+1)^2], SH basis values (column 0 is
+        the constant term).
+    """
     C0 = 0.28209479177387814
     C1 = 0.4886025119029199
     cols = [torch.full((dirs.shape[0],), C0, dtype=dirs.dtype, device=dirs.device)]
@@ -67,7 +74,19 @@ def _sh_bases(deg: int, dirs: torch.Tensor) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ColorMLPV4Wrapper(nn.Module):
+    """TorchScript-traceable wrapper injecting the SH view-direction embedding
+    into a ColorMLP's feature vector before its MLP forward.
+
+    @note: Mirrors `ColorMLP.compose_input`'s feature ordering: base_features |
+        xyz_norm? | cov? | normal? | dir_embed(SH) | non_rigid?.
+    """
+
     def __init__(self, color_mlp, pre_dim: int):
+        """@brief Capture the MLP, activation, and feature-layout info needed to trace forward.
+        @param color_mlp: source ColorMLP-with-SH texture module.
+        @param pre_dim: column count before the SH dir_embed insertion point
+            (see `_pre_sh_feat_dim`).
+        """
         super().__init__()
         self._mlp        = color_mlp.mlp
         self._activation = color_mlp.color_activation
@@ -76,6 +95,16 @@ class _ColorMLPV4Wrapper(nn.Module):
         self._pre_dim    = int(pre_dim)
 
     def forward(self, feat_no_view, xyz, cam_center, R_bwd):
+        """Insert the SH view-direction embedding and run the ColorMLP's MLP.
+
+        @param feat_no_view: [N, K] view-independent features, ordered per the
+            class docstring, with the SH slot not yet inserted.
+        @param xyz: [N, 3] Gaussian centers.
+        @param cam_center: [3] camera center.
+        @param R_bwd: [N, 3, 3] per-Gaussian canonical->posed inverse rotation,
+            applied to the view direction when `cano_view_dir` is set.
+        @return: torch.Tensor of shape [N, C], the MLP's activated color output.
+        """
         if self._sh_degree > 0:
             dir_pp = xyz - cam_center.unsqueeze(0)
             if self._cano:
@@ -92,7 +121,10 @@ class _ColorMLPV4Wrapper(nn.Module):
 
 
 def _pre_sh_feat_dim(color_mlp) -> int:
-    """Column count before the SH dir_embed insertion point (base + xyz? + cov? + normal?)."""
+    """@brief Return the column count before the SH dir_embed insertion point (base + xyz? + cov? + normal?).
+    @param color_mlp: ColorMLP-with-SH texture module.
+    @return: int, feature width before the SH slot.
+    """
     d = int(color_mlp.cfg.feature_dim)
     if getattr(color_mlp, 'use_xyz',    False): d += 3
     if getattr(color_mlp, 'use_cov',    False): d += 6
@@ -101,7 +133,13 @@ def _pre_sh_feat_dim(color_mlp) -> int:
 
 
 def _view_indep_feat_dim(color_mlp) -> int:
-    """Full view-independent feature width K (base + xyz? + cov? + normal? + non_rigid?)."""
+    """Compute the full view-independent feature width K.
+
+    @param color_mlp: ColorMLP-with-SH texture module.
+    @return: int K = base + xyz? + cov? + normal? + non_rigid?.
+    @throws TypeError: if `color_mlp` lacks `cfg.feature_dim` (not a
+        ColorMLP-style texture).
+    """
     if not hasattr(color_mlp, 'cfg') or not hasattr(color_mlp.cfg, 'feature_dim'):
         raise TypeError(
             "colormlp_export requires a ColorMLP-style texture "
@@ -116,7 +154,14 @@ def _view_indep_feat_dim(color_mlp) -> int:
 
 
 def export_color_mlp(color_mlp, K: int, device: torch.device) -> bytes:
-    """Trace the ColorMLP (with SH dir-embed injection) and return a TorchScript blob."""
+    """Trace the ColorMLP (with SH dir-embed injection) to TorchScript.
+
+    @param color_mlp: ColorMLP-with-SH texture module.
+    @param K: view-independent feature width (from `_view_indep_feat_dim`),
+        used to size the trace example inputs.
+    @param device: torch device to trace on.
+    @return: bytes, a serialized TorchScript module.
+    """
     pre_dim = _pre_sh_feat_dim(color_mlp)
     wrapper = _ColorMLPV4Wrapper(color_mlp, pre_dim).to(device).eval()
     N_ex   = 64
@@ -145,7 +190,11 @@ def export_color_mlp(color_mlp, K: int, device: torch.device) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_rotation(r: torch.Tensor) -> torch.Tensor:
-    """Quaternion [N,4] (w,x,y,z) -> rotation matrix [N,3,3]. Device-agnostic."""
+    """@brief Convert quaternions to rotation matrices.
+    @param r: torch.Tensor of shape [N, 4], (w, x, y, z) quaternions (not
+        required to be pre-normalized).
+    @return: torch.Tensor of shape [N, 3, 3], rotation matrices.
+    """
     norm = torch.sqrt((r * r).sum(dim=1))
     q = r / norm[:, None]
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -163,9 +212,17 @@ def _build_rotation(r: torch.Tensor) -> torch.Tensor:
 
 
 def _extract_view_indep_features(color_mlp, gaussians) -> torch.Tensor:
-    """View-independent features [N,K], mirroring ColorMLP.compose_input ordering:
-    base_features | xyz_norm? | cov? | normal? | non_rigid?  (SH dir_embed is
-    injected later inside the traced wrapper, between normal? and non_rigid?)."""
+    """Build the view-independent feature tensor for a duck-typed Gaussian point cloud.
+
+    @param color_mlp: texture module; `use_xyz`/`use_cov`/`use_normal`/
+        `non_rigid_dim` select which optional features are appended.
+    @param gaussians: Gaussian container exposing `get_features`, `get_xyz`,
+        `get_covariance()`, `_scaling`, `_rotation`, and (if non_rigid_dim > 0)
+        `non_rigid_feature`.
+    @return: torch.Tensor of shape [N, K], ordered base_features | xyz_norm? |
+        cov? | normal? | non_rigid? (the SH dir_embed is injected later, inside
+        the traced `_ColorMLPV4Wrapper`, between normal? and non_rigid?).
+    """
     features = gaussians.get_features.squeeze(-1)
     if getattr(color_mlp, 'use_xyz', False):
         aabb     = color_mlp.metadata["aabb"]
@@ -185,8 +242,16 @@ def _extract_view_indep_features(color_mlp, gaussians) -> torch.Tensor:
 
 
 def _extract_R_bwd(gaussians, cano_view_dir: bool) -> torch.Tensor:
-    """Per-Gaussian canonical->posed inverse rotation [N,9] for the SH view dir.
-    Identity when the texture is not cano_view_dir or the cloud has no fwd_transform."""
+    """Compute the per-Gaussian rotation applied to the SH view direction.
+
+    @param gaussians: Gaussian container; if `cano_view_dir` is set and it has
+        a `fwd_transform` attribute, the rotation is taken from its
+        upper-left 3x3 block (transposed).
+    @param cano_view_dir: if False, or if `gaussians` has no `fwd_transform`,
+        the rotation is identity.
+    @return: torch.Tensor of shape [N, 9], flattened 3x3 world->canonical
+        rotation per Gaussian.
+    """
     if cano_view_dir and hasattr(gaussians, 'fwd_transform'):
         T_fwd = gaussians.fwd_transform
         R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
@@ -207,16 +272,26 @@ def _extract_R_bwd(gaussians, cano_view_dir: bool) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ColorMLPModule:
+    """Bundles the full ColorMLP seam for a ColorMLP-with-SH texture: feature
+    width K, TorchScript export, and per-frame view-independent feature/R_bwd
+    extraction."""
+
     def __init__(self, color_mlp):
+        """@brief Wrap a ColorMLP-with-SH texture and compute its feature width `K`.
+        @param color_mlp: source ColorMLP-with-SH texture module.
+        """
         self.color_mlp = color_mlp
         self.cano      = bool(getattr(color_mlp, 'cano_view_dir', False))
         self.K         = _view_indep_feat_dim(color_mlp)
 
     def export(self, device: torch.device) -> bytes:
+        """@brief Trace the wrapped ColorMLP to TorchScript on `device` (see `export_color_mlp`)."""
         return export_color_mlp(self.color_mlp, self.K, device)
 
     def features(self, gaussians) -> torch.Tensor:
+        """@brief Return the [N, K] view-independent features for `gaussians` (see `_extract_view_indep_features`)."""
         return _extract_view_indep_features(self.color_mlp, gaussians)
 
     def R_bwd(self, gaussians) -> torch.Tensor:
+        """@brief Return the [N, 9] per-Gaussian view-direction rotation for `gaussians` (see `_extract_R_bwd`)."""
         return _extract_R_bwd(gaussians, self.cano)

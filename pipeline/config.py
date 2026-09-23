@@ -1,4 +1,4 @@
-"""MISTA config loading (same compose pattern as motion-driven-render.py)."""
+"""MISTA config loading"""
 
 import os
 
@@ -11,6 +11,16 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_mista_config(load_ckpt: str, identity: int):
+    """Compose the MISTA Hydra config for live/test-mode inference on one identity.
+
+    @param load_ckpt: path to the MISTA checkpoint (.pth), written to
+        `config.load_ckpt`.
+    @param identity: identity index, written to `config.appearance_identity`.
+    @return: OmegaConf DictConfig with `mode="test"`, struct mode disabled,
+        `dataset.preload=False`, `wandb_disable=True`, and PLY export disabled
+        if `config.export` exists.
+    @note: Clears and reinitializes the global Hydra instance before composing.
+    """
     configs_dir = os.path.join(_ROOT, "configs")
     if GlobalHydra.instance().is_initialized():
         GlobalHydra.instance().clear()

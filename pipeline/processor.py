@@ -15,6 +15,13 @@ class PoseProcessor:
     """
 
     def __init__(self, args):
+        """Build the One-Euro filters and reset the missing/debug state.
+
+        @param args: parsed CLI namespace; reads `min_cutoff`, `beta`,
+            `derivative_cutoff`, `smooth_frequency`, `filter_space` (filter
+            construction) and, at `process()` time, `smooth`, `reset_after`,
+            `reuse_frames`, `debug`, `debug_head`, `debug_head_csv`.
+        """
         self.args = args
         oe = dict(min_cutoff=args.min_cutoff, beta=args.beta,
                   d_cutoff=args.derivative_cutoff, freq=args.smooth_frequency)
@@ -33,8 +40,21 @@ class PoseProcessor:
         self._head_frame = 0               # frame counter for the head diagnostic
 
     def process(self, raw, t_now):
-        """((raw_pose (72,)|None, raw_trans (3,)|None), timestamp)
-        -> (pose (72,)|None, trans (3,)|None, status str)."""
+        """Smooth one frame's raw pose and apply the missing-detection reuse/reset policy.
+
+        @param raw: tuple `(raw_pose, raw_trans)` — `raw_pose` is a (72,)
+            float32 axis-angle pose or None if no detection; `raw_trans` is a
+            (3,) float32 translation or None.
+        @param t_now: current timestamp (s), passed to the filters.
+        @return: tuple `(pose, trans, status)`. On detection, `pose`/`trans`
+            are the (optionally smoothed) inputs and `status` is `"OK"`. On a
+            miss, within `args.reuse_frames` misses returns the last filtered
+            pose/trans with `status="REUSE <n>"`; beyond that, `(None, None,
+            "NO POSE")`. Filters reset (and cached pose cleared) once misses
+            reach `args.reset_after`.
+        @note: If `args.debug` is set, prints raw/filtered frame-to-frame pose
+            deltas. If `args.debug_head` is set, also calls `_debug_head`.
+        """
         raw_pose, raw_trans = raw
         if raw_pose is not None:
             self.missing_count = 0
@@ -82,13 +102,15 @@ class PoseProcessor:
         return pose, trans, status
 
     def _debug_head(self, raw_pose, pose):
-        """Log neck(12)/head(15) rotation magnitude + yaw, raw vs filtered.
+        """Print and optionally CSV-log neck(12)/head(15) rotation magnitude and yaw, raw vs filtered.
 
-        Diagnostic only (guarded by --debug-head). The yaw proxy is the SMPL-local
-        Y-axis component of the axis-angle in degrees: a head left/right turn is a
-        rotation about the body-up axis (~Y in SMPL local frame), so this tracks the
-        over-the-shoulder turn. SMPL splits a head turn across neck(12)+head(15), so
-        we also report the summed yaw.
+        @param raw_pose: (72,) raw axis-angle pose (pre-filter).
+        @param pose: (72,) filtered axis-angle pose, or None.
+        @note: Diagnostic only, guarded by `--debug-head`. The yaw proxy is
+            the SMPL-local Y-axis component of the axis-angle in degrees (head
+            turn is rotation about the body-up axis in SMPL's local frame);
+            since SMPL splits a head turn across neck(12) and head(15), the
+            summed yaw is also reported. Appends to `args.debug_head_csv` if set.
         """
         def aa(p, j):
             return None if p is None else np.asarray(p[3 * j:3 * j + 3], dtype=np.float32)

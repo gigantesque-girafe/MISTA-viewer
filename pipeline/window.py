@@ -13,6 +13,15 @@ class SourceWindow:
     """
 
     def __init__(self, estimator_name, args, frame_source=None):
+        """Create the OpenCV window.
+
+        @param estimator_name: pose-estimator display name, used in the window title.
+        @param args: parsed CLI namespace; reads `filter_space`, `smooth`,
+            `romp_every_n` in `show()`.
+        @param frame_source: optional pipeline.frame_source.FrameSource, used
+            to render capture-mode instrumentation (grabbed/dropped/input-age)
+            when provided.
+        """
         self.args = args
         self.frame_source = frame_source
         self.win = f"{estimator_name} source (drives C++/SIBR avatar)"
@@ -21,6 +30,17 @@ class SourceWindow:
         self._dt_ema = None
 
     def show(self, frame, status, produce_ms, identity, missing_count):
+        """Render one frame with a status overlay and pump the OpenCV event loop.
+
+        @param frame: np.ndarray, BGR frame to display (not modified in place).
+        @param status: pose status string (e.g. "OK", "REUSE <n>", "NO POSE",
+            "SKIP <n>/<n>"), shown in the overlay.
+        @param produce_ms: last `produce_frame()` duration in ms, shown in the overlay.
+        @param identity: current identity index, shown in the overlay.
+        @param missing_count: consecutive missed-detection count, shown in the overlay.
+        @throws KeyboardInterrupt: if the user presses 'q' or Esc, so the
+            caller's server loop stops cleanly.
+        """
         now = time.perf_counter()
         if self._t_prev_frame is not None:
             dt = now - self._t_prev_frame

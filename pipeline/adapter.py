@@ -9,16 +9,23 @@ from dataset.zjumocap import ZJUMoCapDataset               # for _recompute_bone
 
 def pose_to_camera_fields(smpl_thetas_72, Jtr_target, b02v_inv, device,
                           trans=None, trans_xform=None):
-    """
-    Convert a single ROMP SMPL pose (72-d axis-angle) into the tensors MISTA's
-    deformer consumes: `rots` (1,24,9) and `bone_transforms` (24,4,4). Mirrors
-    dataset/zjumocap.py getitem() exactly.
+    """Convert a single SMPL pose into the tensors MISTA's deformer consumes.
 
-    When `trans` (a (3,) world translation) is provided it is mapped into the
-    canonical frame via `trans_xform` and added to the bone-transform
-    translation column, mirroring dataset/zjumocap.py:465
-    (`bone_transforms[:, :3, 3] += trans`). With `trans=None` the root stays
-    pinned (trans = 0), the original fixed-camera behaviour.
+    @param smpl_thetas_72: array-like of 72 axis-angle values (24 joints x 3).
+    @param Jtr_target: (24, 3) target joint positions for the identity being posed.
+    @param b02v_inv: (24, 4, 4) inverse bind-to-volume bone transform, applied
+        on the right of the recomputed bone transforms.
+    @param device: torch device for the returned tensors.
+    @param trans: optional (3,) world translation; if given, mapped via
+        `trans_xform` (or used as-is if `trans_xform` is None) and added to the
+        bone-transform translation column. If None, the root stays pinned
+        (translation = 0).
+    @param trans_xform: optional callable `(3,) -> (3,)` mapping `trans` into
+        the canonical frame; ignored if `trans` is None.
+    @return: tuple `(rots, bone_transforms)` — `rots` is a `(1, 24, 9)` float
+        tensor, `bone_transforms` is a `(24, 4, 4)` float tensor, both on `device`.
+    @note: Mirrors `dataset/zjumocap.py`'s `__getitem__` exactly, including the
+        `bone_transforms[:, :3, 3] += trans` step at zjumocap.py:465.
     """
     thetas = np.asarray(smpl_thetas_72, dtype=np.float32).reshape(-1)
     root_orient = thetas[0:3]
@@ -46,14 +53,16 @@ def pose_to_camera_fields(smpl_thetas_72, Jtr_target, b02v_inv, device,
 
 
 def smpl_posed_joints(smpl_thetas_72, Jtr_target):
-    """SMPL forward kinematics -> the 24 posed joint positions (24,3) in the SAME
-    frame as MISTA's deformed Gaussians.
+    """Run SMPL forward kinematics to the 24 posed joint positions.
 
-    Mirrors `ZJUMoCapDataset._recompute_bone_transforms` (dataset/zjumocap.py:178)
-    but returns the global joint translations `G_posed[j][:3,3]` instead of the
-    skinning bone transforms. Used to solve a per-frame image-aligned camera
-    (PnP) against the estimator's 2D joints. Joint order is the standard SMPL-24
-    kinematic order (same as ROMP's first 24 `pj2d_org` joints).
+    @param smpl_thetas_72: array-like of 72 axis-angle values (24 joints x 3).
+    @param Jtr_target: (24, 3) target (rest) joint positions for the identity.
+    @return: np.ndarray of shape (24, 3), float32 — posed joint positions in
+        the same frame as MISTA's deformed Gaussians, in standard SMPL-24
+        kinematic order (matching ROMP's first 24 `pj2d_org` joints).
+    @note: Mirrors `ZJUMoCapDataset._recompute_bone_transforms`
+        (dataset/zjumocap.py:178) but returns the global joint translations
+        `G_posed[j][:3, 3]` instead of the skinning bone transforms.
     """
     thetas = np.asarray(smpl_thetas_72, dtype=np.float32).reshape(-1)
     root_orient = thetas[0:3]
@@ -79,14 +88,24 @@ def smpl_posed_joints(smpl_thetas_72, Jtr_target):
 
 
 class MistaPoseAdapter:
-    """Turns a (72,) SMPL pose into the deformer camera MISTA consumes.
-
-    Wraps `pose_to_camera_fields` and the per-identity template camera. Also
-    hands out the canonical (rest-pose) camera for the "no pose yet" case.
-    """
+    """Wraps `pose_to_camera_fields` and the per-identity template camera to
+    convert a (72,) SMPL pose into the deformer camera MISTA consumes."""
 
     def __init__(self, template_cam, Jtr_target, b02v_inv, device, trans_xform=None,
                  retargeter=None):
+        """@brief Store the per-identity template camera and pose-conversion inputs.
+
+        @param template_cam: camera object providing `.copy()` and `.update()`,
+            reused as the base for every posed/canonical camera.
+        @param Jtr_target: (24, 3) target joint positions for this identity.
+        @param b02v_inv: (24, 4, 4) inverse bind-to-volume bone transform.
+        @param device: torch device for pose tensors.
+        @param trans_xform: optional callable `(3,) -> (3,)` mapping a raw
+            translation into the canonical frame; None pins the root (original
+            in-place behavior).
+        @param retargeter: optional IK retarget solver (`--retarget`); None
+            makes `retarget()` a passthrough.
+        """
         self.template_cam = template_cam
         self.Jtr_target = Jtr_target
         self.b02v_inv = b02v_inv
@@ -99,12 +118,15 @@ class MistaPoseAdapter:
         self.retargeter = retargeter
 
     def retarget(self, pose, trans=None):
-        """Filtered (72,) pose (+trans) -> (corrected pose, trans, correction).
+        """Apply the attached IK retarget solver to a filtered pose, if any.
 
-        No-op passthrough when no retargeter is attached (returns the pose and
-        trans unchanged and a None correction). Otherwise runs the IK retarget
-        and returns the corrected pose plus a root-correction offset that
-        `to_camera` applies regardless of the --root-motion gate.
+        @param pose: (72,) SMPL axis-angle pose.
+        @param trans: optional (3,) world translation, forwarded unchanged.
+        @return: tuple `(pose, trans, correction)`. If no retargeter is
+            attached, `pose`/`trans` are returned unchanged and `correction` is
+            None. Otherwise `pose` is IK-corrected and `correction` is the
+            root-correction offset that `to_camera` applies regardless of
+            `--root-motion`.
         """
         if self.retargeter is None:
             return pose, trans, None
@@ -112,6 +134,18 @@ class MistaPoseAdapter:
         return new_pose, trans, correction
 
     def to_camera(self, pose, identity, trans=None, extra_trans=None):
+        """Build a posed camera for `pose` on top of the template camera.
+
+        @param pose: (72,) SMPL axis-angle pose.
+        @param identity: identity index assigned to `cam.person_id`.
+        @param trans: optional (3,) world translation; only applied if
+            `self.trans_xform` is set (i.e. `--root-motion`), otherwise ignored.
+        @param extra_trans: optional (3,) retarget root-correction offset,
+            always added to the bone-transform translation column regardless
+            of `--root-motion`.
+        @return: a copy of `self.template_cam` with `rots`, `bone_transforms`,
+            and `person_id` set for this pose.
+        """
         # Only drive root motion when a mapping is configured (--root-motion).
         trans_in = trans if self.trans_xform is not None else None
         rots, bone_transforms = pose_to_camera_fields(
@@ -130,9 +164,9 @@ class MistaPoseAdapter:
         return cam
 
     def posed_joints(self, pose):
-        """SMPL-24 posed joint positions (24,3) for `pose`, in the Gaussian frame."""
+        """@brief Return the (24, 3) SMPL-24 posed joint positions for `pose`, in the Gaussian frame."""
         return smpl_posed_joints(pose, self.Jtr_target)
 
     def canonical(self):
-        """Rest-pose camera (template as-is), for the first-frame fallback."""
+        """@brief Return the rest-pose (template) camera, for the first-frame fallback."""
         return self.template_cam

@@ -1,7 +1,7 @@
 """
 pipeline: single-responsibility stages for the ROMP/PARE -> MISTA -> C++/SIBR
-VR streaming server. The orchestrator (`LiveVRSource`) lives in
-motion-drive-render-v43.py and wires these together:
+VR streaming server, re-exported below. The orchestrator (`LiveVRSource`)
+lives in render_webcam.py and wires these together:
 
     FrameSource       -> next BGR frame (webcam/video), end-of-stream signal
     PoseEstimator     -> raw (72,) SMPL pose or None            (ROMP/PARE)

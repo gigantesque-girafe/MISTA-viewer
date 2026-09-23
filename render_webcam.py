@@ -1,39 +1,30 @@
 """
-motion-drive-render-v43.py  —  ROMP -> MISTA driving the C++/SIBR viewer (Phase 2)
+render_webcam.py: ROMP -> MISTA driving the C++/SIBR viewer (Phase 2)
 
-Phase 1 (`motion-driven-render.py`) rendered MISTA in-process and showed a Python
-side-by-side. Phase 2 keeps the SAME working ROMP -> One-Euro filter pipeline but,
-instead of rendering in Python, streams the deformed Gaussian attributes to the
-EXISTING C++/SIBR viewer over the EXISTING CUDA-IPC path (so the C++ side keeps doing
-the rasterization and its ColorMLP), and opens a SECOND Python/OpenCV window that shows
-only the ORIGINAL source frame driving the currently-sent pose.
+Phase 1 (`render_vr.py`) renders MISTA from a predefined sequence.
+Phase 2 replaces the static `smpl_cams` sequence with a live capture ->
+ROMP -> One-Euro -> `pose_to_camera_fields` pipeline.
 
-    Window 1 (C++/SIBR process) : rendered MISTA identity   (unchanged viewer)
-    Window 2 (this Python proc) : original webcam/video frame
+The rest of the pipeline is unchanged:
+  - `MistaVRSource` handles deformation, view-independent features, and axis fix.
+  - `vr_viewer.run_server` handles TCP/IPC, double-buffering, and pacing unchanged.
+  - The C++/SIBR viewer performs Gaussian rasterization and ColorMLP.
+  - Python sends the same 5 per-Gaussian attribute tensors over the existing CUDA-IPC path.
 
-Architecture (nothing on the C++ side changes):
-  - The C++ viewer speaks a fixed wire protocol (handshake "V42E", per-frame packet
-    <Q pipeline_frame_id, I buf_idx, I N>, control channel CTL0/1/2). It is agnostic to
-    where poses come from, so this ROMP-driven server drives the ALREADY-BUILT
-    SIBR_remoteGaussianDesktopV42_app (or the OpenXR VR viewer) with NO C++ changes.
-  - We reuse `render_vr_v1_modular.MistaVRSource` (deformation + view-independent feature
-    extraction + axis fix) and only swap its static predict-sequence `smpl_cams` list for
-    a LIVE capture -> ROMP -> One-Euro -> pose_to_camera_fields step inside produce_frame.
-  - `vr_viewer.run_server` (TCP / IPC / double-buffering / pacing) is reused UNCHANGED.
-  - ColorMLP + Gaussian rasterization stay entirely on the C++ side. We only send the
-    5 per-Gaussian attribute tensors, exactly like the original MISTA VR adapter.
+Windows:
+  - C++/SIBR viewer: rendered MISTA identity.
+  - Python/OpenCV: original webcam/video frame driving the current pose.
+
+Protocol:
+  The C++ viewer uses the existing `V42E` handshake and per-frame
+  `<Q pipeline_frame_id, I buf_idx, I N>` packets. No C++ changes are required.
 
 Synchronization:
-  The same captured frame's pose is deformed, packed into the IPC buffer, announced to
-  C++, and cv2.imshow'n WITHIN ONE produce_frame() call, so source-frame N and pose N are
-  coupled by call ordering. C++ renders the newest buffer asynchronously, so the avatar
-  trails the source window by <= one C++ render frame. The protocol's `pipeline_frame_id`
-  is a server counter (not the source-video index); there is no source-index handshake,
-  so sync relies on same-call ordering + newest-buffer semantics, not an explicit ID.
-
-Note: the OpenCV source window opens only AFTER a C++ viewer connects, because
-produce_frame() runs inside the server's per-connection loop. Start this script first
-(it listens), then launch the viewer.
+  Capture, pose estimation, deformation, IPC submission, and `cv2.imshow`
+  occur in the same `produce_frame()` call. Thus source frame N and pose N
+  are coupled by call order. The C++ viewer renders asynchronously from the
+  newest buffer, so the rendered avatar may lag by up to one C++ render frame.
+  `pipeline_frame_id` is a server counter, not a source-frame index.
 
 Run:
   # 1) Python server (webcam)
@@ -46,10 +37,6 @@ Run:
   submodules\\sibr-core\\install\\bin\\SIBR_remoteGaussianDesktopV42_app_rwdi.exe --ip 127.0.0.1 --port 6012
   # 2) VR viewer (unchanged)
   submodules\\sibr-core\\install\\bin\\SIBR_remoteGaussianOpenXRv4_2_app_rwdi.exe --ip 127.0.0.1 --port 6012
-
-Smoothing / missing-detection behavior and flags are identical to Phase 1.
-This file adds NO changes to vr_viewer/*, render_vr_v1_modular.py, motion-driven-render.py
-or any C++/SIBR/CUDA-IPC code.
 """
 
 import os
@@ -61,7 +48,7 @@ import cv2
 import numpy as np
 import torch
 
-# ── Optional per-stage profiler (opt-in; zero cost unless MISTA_PROFILE=1) ──────
+# ---------- Optional per-stage profiler (opt-in; zero cost unless MISTA_PROFILE=1) --------
 # Set MISTA_PROFILE=1 to print median per-stage timings every MISTA_PROFILE_EVERY
 # frames. CUDA is async, so we torch.cuda.synchronize() around the GPU stage to
 # measure real execution time rather than kernel-launch time.
@@ -71,12 +58,18 @@ _PROF = {"cap": [], "est": [], "rtg": [], "rnd": [], "tot": []}
 
 
 def _prof_report():
+    """Print median per-stage timings from `_PROF` and trim it to the last 300 samples.
+
+    @note: No-op if `_PROF["tot"]` is empty. Trims all `_PROF` lists to their
+        last 300 entries as a side effect, bounding memory.
+    """
     import statistics as _st
     n = len(_PROF["tot"])
     if n == 0:
         return
 
     def med(k):
+        """@brief Return the median of `_PROF[k]`, or 0.0 if empty."""
         v = _PROF[k]
         return _st.median(v) if v else 0.0
 
@@ -125,16 +118,31 @@ from pipeline.retarget import (add_retarget_args, build_retargeter,  # optional 
 # this class only sequences them per produce_frame() call.
 # --------------------------------------------------------------------------- #
 class LiveVRSource(VRSource):
-    """Thin orchestrator wiring the pipeline stages into the server contract.
+    """VRSource implementation sequencing the FrameSource/PoseEstimator/PoseProcessor/
+    MistaPoseAdapter/MistaRenderer pipeline into per-frame tensors for the C++ viewer.
 
-    Owns no domain logic beyond per-frame sequencing and the --romp-every-n skip
-    policy: each produce_frame() reads a frame, (every Nth) estimates + processes
-    + adapts + renders a pose, freezes the last avatar on miss/skip, previews the
-    frame, and hands the 5-tuple back to run_server for IPC to C++.
+    @note: Owns no domain logic beyond per-frame sequencing and the
+        --romp-every-n skip policy: each `produce_frame()` reads a frame, (every
+        Nth) estimates + processes + adapts + renders a pose, freezes the last
+        avatar on miss/skip, previews the frame, and returns the 5-tuple.
     """
 
     def __init__(self, frame_source, estimator, processor, adapter, renderer, args,
                  head_pose=None):
+        """Wire the pipeline collaborators together and derive the VRSource handshake fields.
+
+        @param frame_source: pipeline.frame_source.FrameSource providing BGR frames.
+        @param estimator: pipeline.estimators.PoseEstimator backend (ROMP/BEV/PARE/HybrIK).
+        @param processor: pipeline.processor.PoseProcessor (One-Euro smoothing + miss handling).
+        @param adapter: pipeline.adapter.MistaPoseAdapter (pose -> MISTA camera).
+        @param renderer: pipeline.renderer.MistaRenderer (camera -> attribute tensors);
+            supplies `device`, `N_max`, `K`, `model_bytes` for the VRSource handshake.
+        @param args: parsed CLI namespace (from `parse_args`); read for
+            `identity`, `head_amplify(_gain/_max)`, `no_window`, `retarget`,
+            `source_betas_frames`, `romp_every_n` at runtime.
+        @param head_pose: optional face-driven head-pose source (pipeline.headpose.FaceHeadPose);
+            None disables face-driven head override.
+        """
         self.frame_source = frame_source
         self.estimator = estimator          # PoseEstimator (ROMP/PARE adapter)
         self.processor = processor
@@ -166,8 +174,13 @@ class LiveVRSource(VRSource):
         self._betas_buf = []                # accumulates estimator.last_betas until lock
 
     def _maybe_lock_source_skeleton(self):
-        """Collect one valid frame's betas; once N are gathered, build source_Jtr
-        and attach the retarget solver. No-op unless deferred."""
+        """Accumulate estimator betas and attach the retarget solver once enough are collected.
+
+        @note: No-op unless retarget was requested without `--source-jtr-npz`
+            (`self._defer_retarget`), or if the estimator has no `last_betas`
+            yet. Once `args.source_betas_frames` betas are buffered, builds
+            `source_Jtr` from their mean and assigns `self.adapter.retargeter`.
+        """
         if not self._defer_retarget:
             return
         betas = getattr(self.estimator, "last_betas", None)
@@ -187,9 +200,22 @@ class LiveVRSource(VRSource):
               f"{self.args.source_betas_frames} frames.", flush=True)
 
     def on_connect(self):
+        """Forward the connect event to the renderer (see `MistaRenderer.on_connect`)."""
         self.renderer.on_connect()
 
     def produce_frame(self, frame_idx: int):
+        """Read one live frame, drive the pose pipeline, and return the packed avatar tensors.
+
+        @param frame_idx: unused positionally; frame pacing is driven by
+            `self._romp_ctr` and `args.romp_every_n` instead.
+        @return: the 5-tuple produced by `MistaRenderer.render` (xyz, feat,
+            R_bwd, opacity, cov3D) for the current or last-cached pose.
+        @note: Runs the estimator only every `args.romp_every_n` frames,
+            reusing `self.last_tensors` on skipped frames; on no detected pose
+            with nothing cached yet, renders the canonical (T-pose) avatar
+            once. Applies a pending identity switch from the C++ GUI
+            (`self.pending_id`) before reading the frame.
+        """
         t0 = time.perf_counter()
 
         # ── Live identity switch from the C++ GUI (CTL0) -> re-decode once ─────
@@ -287,6 +313,14 @@ class LiveVRSource(VRSource):
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_args():
+    """Define and parse the CLI arguments for the ROMP/BEV/PARE/HybrIK -> MISTA -> SIBR pipeline.
+
+    @return: argparse.Namespace with all pipeline, estimator, smoothing,
+        head-pose, root-motion, and retarget options (see `add_retarget_args`
+        for the retarget group).
+    @throws SystemExit: via argparse, on missing required arguments (e.g.
+        `--load-ckpt`) or invalid choices.
+    """
     p = argparse.ArgumentParser(
         description="ROMP -> MISTA -> C++/SIBR viewer (Phase 2), with a Python source window")
     p.add_argument("--source", choices=["webcam", "video"], default="webcam")
@@ -479,11 +513,16 @@ def parse_args():
 
 
 def build_trans_xform(args):
-    """Closure mapping a raw (3,) cam_trans into the canonical frame, or None.
+    """Build the closure that maps a raw cam_trans vector into the canonical frame.
 
-    Returns None unless --root-motion is set (so the adapter pins the root).
-    Applies, in order: axis permute+sign (--root-axis), scale (--root-scale),
-    and optional depth zeroing (--root-horizontal).
+    @param args: parsed CLI namespace; reads `root_motion`, `root_axis`,
+        `root_scale`, `root_horizontal`.
+    @return: None if `args.root_motion` is False (root stays pinned); otherwise
+        a callable `xform(trans) -> np.ndarray[3]` applying, in order, the
+        `--root-axis` permute+sign, `--root-scale`, and optional
+        `--root-horizontal` depth zeroing.
+    @throws SystemExit: if `args.root_axis` has a token outside x/y/z (with
+        optional leading -) or does not have exactly 3 comma-separated axes.
     """
     if not args.root_motion:
         return None
@@ -506,6 +545,10 @@ def build_trans_xform(args):
     horizontal = args.root_horizontal
 
     def xform(trans):
+        """@brief Map a raw (3,) cam_trans vector into the canonical frame per the enclosing args.
+        @param trans: array-like of length 3 (raw cam_trans).
+        @return: np.ndarray[3], float32.
+        """
         t = np.asarray(trans, dtype=np.float32).reshape(-1)
         out = (t[idx] * sign) * scale
         if horizontal:
@@ -516,6 +559,13 @@ def build_trans_xform(args):
 
 
 def main():
+    """Validate CLI args, build the MISTA scene and pipeline stages, and run the streaming server.
+
+    @throws SystemExit: on invalid argument combinations (`--source video`
+        without `--video`, `--identity` outside 0..7, `--romp-every-n` < 1).
+    @note: Blocks until `run_server` returns; releases the frame source and
+        destroys OpenCV windows on exit.
+    """
     args = parse_args()
     if args.source == "video" and not args.video:
         raise SystemExit("--source video requires --video PATH")

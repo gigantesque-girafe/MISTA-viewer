@@ -1,22 +1,8 @@
 """
-vr_viewer  —  Reusable CUDA-IPC VR streaming transport for the SIBR remote
-OpenXR viewer.
+vr_viewer: CUDA-IPC transport for the SIBR remote viewer.
 
-Pipeline-agnostic. To wire the viewer onto a new pipeline, implement a
-`VRSource` subclass that produces the six per-Gaussian attribute tensors for a
-frame, then call `run_server(source, port)`. The pipeline's own render.py /
-training code is never touched.
-
-    from vr_viewer import VRSource, run_server
-
-    class MySource(VRSource):
-        def __init__(self, ...):
-            self.device, self.N_max, self.K = ...
-            self.model_bytes, self.n_frames = ...
-        def produce_frame(self, i):
-            return xyz, feat, R_bwd, opacity, scale, rot
-
-    run_server(MySource(...), port=6012)
+A `VRSource` provides the six per-Gaussian attributes for each frame.
+`run_server(source, port)` handles streaming to the C++ viewer.
 """
 
 from .server import VRSource, run_server
