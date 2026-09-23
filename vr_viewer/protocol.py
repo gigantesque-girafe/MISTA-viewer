@@ -1,10 +1,10 @@
 """
-vr_viewer.protocol  —  Pipeline-agnostic wire protocol for the SIBR remote
+vr_viewer.protocol  —  wire protocol for the SIBR remote
 OpenXR application v4.2 (SIBR_remoteGaussianOpenXRv4_2_app.exe).
 
-Both the startup handshake (port 6012, magic b"V42E") and the per-frame packet
-are defined here so every adapter speaks exactly the same bytes. Wire v2 ("V42E")
-carries cov3D[6] in the buffer tail instead of the old scale[3]+rot[4].
+Both the startup handshake (port 6012, b"V42E") and the per-frame packet
+are defined here so every adapter speaks exactly the same bytes. Wire "V42E"
+carries cov3D[6] in the buffer tail.
 """
 
 import select
@@ -19,7 +19,7 @@ HANDSHAKE = b"V42E"    # matches SIBR_remoteGaussianOpenXRv4_2_app
                        # (must match the magic sent by the C++ viewer's handshake).
 DEFAULT_PORT = 6012
 
-# ── Client -> server control channel ─────────────────────────────────────────
+# Client -> server control channel 
 # During streaming the server free-runs sending 16-byte frame packets and never
 # reads. The C++ viewer's GUI can send a small control message the other way on
 # the same (full-duplex) socket. Each message is 8 bytes: magic + int32 payload.

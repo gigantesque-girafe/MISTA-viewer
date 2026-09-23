@@ -1,21 +1,21 @@
 """
-vr_viewer.colormlp_export  —  OPTIONAL helper for pipelines whose texture is a
-ColorMLP-with-SH (the 3dgs-v2 / MISTA family).
+vr_viewer.colormlp_export: helper for pipelines whose texture is a
+ColorMLP with SH (3DGS-v2 / MISTA family).
 
-This module is *duck-typed and import-clean*: it never imports anything from a
-specific pipeline (no `models`, `scene`, `utils`, `hydra`). It only reads
-attributes off the `color_mlp` object you pass in:
-    .mlp, .color_activation, .sh_degree, .cano_view_dir,
-    .cfg.feature_dim, .use_xyz, .use_cov, .use_normal, .non_rigid_dim
+This module has no pipeline-specific imports. It only reads these attributes
+from the `color_mlp` object:
+    .mlp
+    .color_activation
+    .sh_degree
+    .cano_view_dir
+    .cfg.feature_dim
+    .use_xyz
+    .use_cov
+    .use_normal
+    .non_rigid_dim
 
-so it is safe to live in the reusable package. It knows how to *serialize* a
-ColorMLP into the TorchScript blob sent at handshake and how to size the
-view-independent feature vector K. It does NOT know how to read your Gaussians —
-extracting per-frame features from your own point cloud stays in your adapter,
-because that touches your pipeline's data model.
-
-If a pipeline's texture is not a ColorMLP-with-SH, don't use this module; write
-your own export in the adapter instead.
+It serializes the ColorMLP into the TorchScript blob sent during the handshake
+and determines the size K of the view-independent feature vector.
 """
 
 import io
@@ -28,11 +28,6 @@ import torch.nn.functional as F
 # already hold a K and just want the TorchScript blob. Everything else
 # (SH basis, the traced wrapper, dim/feature helpers) is a private detail.
 __all__ = ["ColorMLPModule", "export_color_mlp"]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SH basis (trace-friendly)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _sh_bases(deg: int, dirs: torch.Tensor) -> torch.Tensor:
     """Evaluate real spherical-harmonic basis functions up to degree `deg` at `dirs`.
@@ -64,14 +59,6 @@ def _sh_bases(deg: int, dirs: torch.Tensor) -> torch.Tensor:
                     C3[5]*z*(xx-yy), C3[6]*x*(xx-3*yy),
                 ])
     return torch.stack(cols, dim=1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TorchScript wrapper — mirrors ColorMLP.compose_input ordering.
-#   base_features | xyz_norm? | cov? | normal? | dir_embed(SH) | non_rigid?
-# The SH dir_embed is inserted after the geometric features and BEFORE the
-# non-rigid block, so pre_dim = feature_dim + xyz? + cov? + normal?.
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _ColorMLPV4Wrapper(nn.Module):
     """TorchScript-traceable wrapper injecting the SH view-direction embedding
@@ -177,18 +164,6 @@ def export_color_mlp(color_mlp, K: int, device: torch.device) -> bytes:
     torch.jit.save(traced, buf)
     return buf.getvalue()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-frame feature extraction (view-independent half of ColorMLP.compose_input).
-#
-# These read a Gaussian point cloud via the same duck-typed attribute names the
-# 3dgs-v2 / MISTA ColorMLP family uses (get_features, get_xyz, get_covariance,
-# _scaling, _rotation, non_rigid_feature). They stay import-clean: `build_rotation`
-# is reimplemented locally rather than pulled from a pipeline's utils. If your
-# Gaussian model exposes these attributes, the whole ColorMLP seam lives here and
-# your adapter never has to reimplement compose_input.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_rotation(r: torch.Tensor) -> torch.Tensor:
     """@brief Convert quaternions to rotation matrices.
     @param r: torch.Tensor of shape [N, 4], (w, x, y, z) quaternions (not
@@ -260,16 +235,6 @@ def _extract_R_bwd(gaussians, cano_view_dir: bool) -> torch.Tensor:
     dev = gaussians.get_xyz.device
     return torch.eye(3, dtype=torch.float32, device=dev)\
                .unsqueeze(0).expand(N, -1, -1).reshape(N, 9).contiguous()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ColorMLPModule — the full ColorMLP seam as one object.
-#
-# Bundles everything the adapter needs from a ColorMLP-with-SH texture: feature
-# width K, the TorchScript export, and per-frame view-independent feature /
-# R_bwd extraction. Construct it once from the texture, hand `model_bytes` and
-# `K` to the VR source, and call `.features()` / `.R_bwd()` in produce_frame.
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ColorMLPModule:
     """Bundles the full ColorMLP seam for a ColorMLP-with-SH texture: feature

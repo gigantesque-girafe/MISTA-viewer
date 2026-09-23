@@ -1,13 +1,7 @@
 """
-vr_viewer.ipc  —  Pipeline-agnostic CUDA-IPC transport primitives.
-
-Extracted verbatim (behaviour-preserving) from render_vr_v1.py. Nothing in this
-module knows anything about MISTA, Gaussians-from-MIGS, deformation or Hydra — it
-is pure CUDA-IPC plumbing shared by every pipeline that wants to feed the SIBR
-remote OpenXR viewer.
-
-  * GaussianAttrBuffer  — fixed-capacity contiguous CUDA float32 buffer.
-  * GaussianIPCManager  — cudaIpc mem/event handle owner + frame signalling.
+vr_viewer.ipc: CUDA-IPC transport primitives.
+  * GaussianAttrBuffer: fixed-capacity contiguous CUDA float32 buffer.
+  * GaussianIPCManager: cudaIpc mem/event handle owner + frame signalling.
 """
 
 import ctypes
@@ -20,9 +14,8 @@ import torch
 log = logging.getLogger("vr_viewer.ipc")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -------------------------
 # Inline CUDA IPC utilities
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _IpcMem(ctypes.Structure):
     """ctypes mirror of CUDA's `cudaIpcMemHandle_t` (64 opaque bytes)."""
@@ -98,9 +91,8 @@ def get_ipc_offset(tensor: torch.Tensor) -> int:
     return tensor.data_ptr() - base.value
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------
 # Pre-allocated CUDA buffer for all Gaussian attributes
-# ─────────────────────────────────────────────────────────────────────────────
 
 class GaussianAttrBuffer:
     """Fixed-capacity contiguous CUDA float32 buffer holding all per-Gaussian
@@ -187,9 +179,8 @@ class GaussianAttrBuffer:
         self._cov_v[:N].copy_(cov3D, non_blocking=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -------------------------
 # CUDA IPC handle manager
-# ─────────────────────────────────────────────────────────────────────────────
 
 class GaussianIPCManager:
     """Owns the CUDA IPC memory/event handles for one `GaussianAttrBuffer` and

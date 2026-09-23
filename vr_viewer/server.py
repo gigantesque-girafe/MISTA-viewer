@@ -1,7 +1,7 @@
 """
-vr_viewer.server  —  Pipeline-agnostic double-buffered streaming loop.
+vr_viewer.server: Double-buffered streaming loop.
 
-This is the reusable heart of the VR viewer. It owns:
+It owns:
   * IPC buffer + handle allocation (double-buffered),
   * the TCP accept / reconnect loop,
   * the startup handshake,
@@ -9,8 +9,8 @@ This is the reusable heart of the VR viewer. It owns:
 
 Everything that is *pipeline-specific* is hidden behind the `VRSource`
 interface below. To bring the viewer to a new pipeline you implement ONE
-subclass of `VRSource` (see render_vr_v1_modular.py for the MISTA example) and
-call `run_server(source, port)`. render.py / your training code stays intact.
+subclass of `VRSource` (see render_vr.py for the MISTA example) and
+call `run_server(source, port)`.
 """
 
 import os
@@ -37,11 +37,11 @@ class VRSource:
     """Contract between a pipeline and the generic streaming loop.
 
     A subclass must set these attributes (typically in `__init__`/setup):
-        device       : torch.device   — CUDA device the attribute tensors live on
-        N_max        : int            — IPC buffer capacity (>= max Gaussian count)
-        K            : int            — per-Gaussian view-independent feature dim
-        model_bytes  : bytes          — TorchScript Color-MLP blob sent at handshake
-        n_frames     : int            — number of animation frames to cycle over
+        device       : torch.device    CUDA device the attribute tensors live on
+        N_max        : int             IPC buffer capacity (>= max Gaussian count)
+        K            : int             per-Gaussian view-independent feature dim
+        model_bytes  : bytes           TorchScript Color-MLP blob sent at handshake
+        n_frames     : int             number of animation frames to cycle over
     """
 
     device: torch.device
@@ -62,7 +62,7 @@ class VRSource:
             subclass is responsible for wrapping it (e.g. `frame_idx % n_frames`).
         @return: tuple `(xyz, feat, R_bwd, opacity, cov3D)`, all CUDA tensors
             ready to be copied into the IPC buffer. `cov3D` is [N, 6] (posed
-            covariance upper triangle) — the cov3D_precomp path, matching
+            covariance upper triangle) the cov3D_precomp path, matching
             render.py (compute_cov3D_python=True).
         """
         raise NotImplementedError
@@ -80,23 +80,9 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
     @param target_fps: target frame pacing; overridden by the `VR_PRODUCE_HZ`
         env var if set (> 0).
     @note: Runs until KeyboardInterrupt. Accepts and re-accepts connections in
-        a loop (a dropped connection does not stop the server). Honors two
-        diagnostic env vars: `VR_PRODUCE_HZ` (hard-cap producer rate) and
-        `VR_FREEZE_AFTER` (auto-pause after N frames, connection stays up).
+        a loop (a dropped connection does not stop the server
     """
     target_frame_seconds = 1.0 / target_fps
-
-    # Diagnostics / fix knobs (env):
-    #   VR_PRODUCE_HZ   : hard-cap the producer to this rate. The default cap does
-    #                     nothing when produce > 33 ms; this forces a real sleep so
-    #                     the GPU is freed for the render process. This is the fix
-    #                     for deform<->render GPU contention.
-    #   VR_FREEZE_AFTER : start paused after this many frames. Equivalent to the
-    #                     viewer's Pause button, but without needing a viewer: the
-    #                     TCP connection stays up and C++ keeps rendering, but
-    #                     Python does ZERO GPU work. If C++'s mlp/raster times then
-    #                     drop, the slowdown was GPU contention with the deformer
-    #                     (not thermal).
     produce_hz = float(os.environ.get("VR_PRODUCE_HZ", "0"))
     if produce_hz > 0:
         target_frame_seconds = 1.0 / produce_hz
@@ -132,18 +118,18 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                 buf_idx = 0
                 anim_frame = 0
                 # Animation pause state. A fresh viewer connection always starts
-                # running; VR_FREEZE_AFTER re-arms below on its own frame count.
+                # running; 
                 paused = False
                 announced_pause = False
                 step_delta = 0
                 last_frame = 0
-                freeze_armed = bool(freeze_after)   # VR_FREEZE_AFTER fires once, then disarms
+                freeze_armed = bool(freeze_after)   
                 last_buf, last_N = 0, source.N_max
 
                 while True:
                     t0 = time.perf_counter()
 
-                    # ── Client -> server control messages (e.g. GUI identity switch).
+                    # Client -> server control messages (e.g. GUI identity switch).
                     # Non-blocking; sets a pending request the source applies at the
                     # top of its next produce_frame (between frames, no race).
                     for magic, payload in poll_control(conn):
@@ -177,12 +163,12 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                         paused = True
                         freeze_armed = False
 
-                    # ── Paused: keep the socket + C++ rendering alive, but do ZERO
-                    # GPU work — just re-announce the last good buffer. A pending
+                    # Paused: keep the socket + C++ rendering alive, but do ZERO
+                    # GPU work just re-announce the last good buffer. A pending
                     # step falls through to produce exactly one new frame.
                     if paused and step_delta == 0:
                         if not announced_pause:
-                            log.info("[PAUSE] producer stopped on frame %d — re-announcing "
+                            log.info("[PAUSE] producer stopped on frame %d re-announcing "
                                      "buf %d (N=%d). Python GPU now idle; watch C++ mlp/raster.",
                                      last_frame, last_buf, last_N)
                             announced_pause = True
@@ -205,18 +191,18 @@ def run_server(source: VRSource, port: int = DEFAULT_PORT, target_fps: int = 30)
                     ipc_mgrs[buf_idx].wait_read_complete()
                     wait_ms = (time.perf_counter() - tw) * 1000.0
 
-                    # ── Pipeline-specific frame production ────────────────────
+                    # Pipeline-specific frame production
                     t1 = time.perf_counter()
                     xyz, feat, R_bwd, opacity, cov3D = source.produce_frame(anim_frame)
                     produce_ms = (time.perf_counter() - t1) * 1000.0
                     N = xyz.shape[0]
 
-                    # ── Pack into IPC buffer (GPU-to-GPU, non-blocking) ───────
+                    # Pack into IPC buffer (GPU-to-GPU, non-blocking)
                     t3 = time.perf_counter()
                     attr_bufs[buf_idx].write(xyz, feat, R_bwd, opacity, cov3D)
                     pack_ms = (time.perf_counter() - t3) * 1000.0
 
-                    # ── Sync + record data-ready event, announce frame ────────
+                    # Sync + record data-ready event, announce frame
                     t4 = time.perf_counter()
                     ipc_mgrs[buf_idx].record_data_ready()
                     conn.sendall(struct.pack("<QII", pipeline_frame_id, buf_idx, N))
