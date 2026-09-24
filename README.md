@@ -269,11 +269,41 @@ We sincerely thank the authors of these works for making their research and reso
 3. Configure paths — copy `.env.example` to `.env` and edit it (see **Path configuration**).
 4. Download weights: `powershell -ExecutionPolicy Bypass -File scripts\fetch_assets.ps1`
    (then place SMPL models and run `python extract_smpl_parameters.py` as instructed).
-5. Launch producer + viewer together:
+5. Build the SIBR viewer (see **Building the SIBR viewer** below):
+   ```bash
+   build_openxr.bat --gpu blackwell --libtorch <path to LibTorch>
+   ```
+6. Launch producer + viewer together:
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts\run_demo.ps1 -Identity 2          # VR
    powershell -ExecutionPolicy Bypass -File scripts\run_demo.ps1 -Desktop             # desktop mirror
    ```
+
+### Building the SIBR viewer
+
+`build_openxr.bat` compiles the two native viewers referenced above
+(`SIBR_remoteGaussianOpenXRv4_2_app`, `SIBR_remoteGaussianDesktopV42_app`).
+Unlike the Python side, this script is **not** driven by `.env` — a few
+paths at the top of the file are machine-specific and must be edited once
+per machine before the first build:
+
+| Variable | Meaning | Default needs editing? |
+| --- | --- | --- |
+| `CUDA_DIR` | CUDA Toolkit install path | Only if not installed at `CUDA/v12.8` |
+| `VS_VCVARS` | path to VS BuildTools' `vcvars64.bat` | Only if VS is installed elsewhere / a different edition (Community vs BuildTools) |
+| `CMAKE_BIN` | folder containing a cmake ≥ 3.22 | **Yes** — ships as a `C:\TODO\...` placeholder |
+| LibTorch | pass via `--libtorch <path>` | **Yes** — always required, no default |
+
+`REPO_ROOT`/`SIBR_SRC`/`SIBR_BUILD`/`SIBR_INSTALL` are auto-detected from the
+script's own location, so no edit is needed there.
+
+Pick your GPU generation with `--gpu turing` (compute capability 7.5) or
+`--gpu blackwell` (compute capability 12.0); `--target v4.2` or
+`--target desktop` builds just one viewer instead of both. See the comments
+at the top of `build_openxr.bat` for full usage.
+
+If you are instead building on the RTX 1080 dev workstation, use
+`build_openxr_1080.bat` (hardcoded paths, no `--gpu` flag needed).
 
 ### Path configuration
 
@@ -313,7 +343,7 @@ conda activate mista
 set KMP_DUPLICATE_LIB_OK=TRUE
 ```
 
-### `render_vr.py` — pre-recorded sequence playback
+### `render_vr.py` pre-recorded sequence playback
 
 General formula:
 
@@ -343,12 +373,12 @@ Key Hydra overrides:
 | `migs.type` | `tt5d`, `tt5d_color_split`, `cp` | representation (TT for MISTA, `cp` for MIGS) |
 | `migs.use_mars` | `false` / `true` | adaptive-rank (MISTA-AR) variant |
 | `dataset.predict_seq` | `0,1,2,3` | which motion/dance sequence to play back |
-| `appearance_identity` | `0`–`7` | which learned identity to render (see note below) |
+| `appearance_identity` | `0`-`7` | which learned identity to render (see note below) |
 | `load_ckpt` | path to `.pth` | trained avatar checkpoint |
 | `wandb_disable` | `True` | skip Weights & Biases logging |
 | `+gaussians_vr.port` | `6012` (default) | TCP port the SIBR viewer connects to |
 
-### `render_webcam.py` — live video / webcam drive
+### `render_webcam.py` live video / webcam drive
 
 General formula:
 
@@ -358,7 +388,7 @@ python render_webcam.py --source <video|webcam> [--video <PATH> | --camera-index
   --port <PORT> [--trt --trt-fp16 --trt-lib-dir "<TensorRT lib>"] [flags...]
 ```
 
-Working examples (from my machine — adjust the checkpoint):
+Working examples (from my machine, adjust the checkpoint):
 
 ```shell
 # video file, ROMP estimator (default smoothing on)
@@ -384,7 +414,7 @@ Key CLI flags (see `python render_webcam.py --help` for the full list, incl. hea
 | `--source` | `webcam` / `video` | live camera or a video file |
 | `--video` | path | input video (with `--source video`) |
 | `--camera-index` | `0` | webcam index (with `--source webcam`) |
-| `--identity` | `0`–`7` | target MISTA identity (see note below) |
+| `--identity` | `0`-`7` | target MISTA identity (see note below) |
 | `--load-ckpt` | path (required) | MISTA 8-identity checkpoint `.pth` |
 | `--estimator` | `romp` / `bev` / `pare` / `hybrik` | pose-estimation backend |
 | `--port` | `6012` | TCP port the SIBR viewer connects to |
@@ -419,7 +449,7 @@ Desktop viewer camera (mouse trackball, hover the rendered image — not the win
 | --- | --- |
 | Left-drag | orbit the avatar (roll if you start in the outer border) |
 | Right-drag | pan (dolly if you start in the outer border) |
-| Scroll | zoom in / out — no keyboard key may be held |
+| Scroll | zoom in / out, no keyboard key may be held |
 | `Y` | toggle FPS/WASD mode (the old keyboard navigation) and back |
 | `P` / `Left` / `Right` | pause-resume the animation / step +/-1 frame (camera stays live) |
 
@@ -428,21 +458,4 @@ The `Camera ...` ImGui panel has the same mode dropdown plus FoV, near/far and c
 * Surveille le GPU
 ```
 nvidia-smi dmon
-```
-
-### Running double viewer
-Both tiles share one camera: drag inside either one and both viewpoints move together
-(same controls as the single-tile table above).
-```shell
-# Low resolution
-& "submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
-
-# high resolution
-& "submodules\sibr-core\install\bin\SIBR_remoteGaussianDesktopV42_app_rwdi.exe" --port 6012 --port2 6013 --width 512 --height 512 --label1 TT5D --label2 CP
-
-#Terminal 1 — TT5D
-python render_vr.py mode=predict dataset=migs_multi_zju_5d_mars migs.type=tt5d migs.use_mars=false dataset.predict_seq=0 appearance_identity=2 wandb_disable=True load_ckpt="%MISTA_CKPT%" +gaussians_vr.port=6012
-
-#Terminal 2 — CP-R100
-python render_vr.py mode=predict dataset.predict_seq=0 dataset=migs opt.iterations=50000 migs.type=cp migs.use_mars=false appearance_identity=2 load_ckpt="%MISTA_CKPT%" wandb_disable=True +gaussians_vr.port=6013
 ```

@@ -8,6 +8,7 @@
 	path = submodules/sibr-core
 	url = git@github.com:giangvtr/sibr-core.git
 	branch = win11-rtx1080
+# optional submodules
 [submodule "submodules/PARE"]
 	path = submodules/PARE
 	url = https://github.com/mkocabas/PARE.git

@@ -50,7 +50,7 @@ if (-not (Test-Path $viewer)) { throw "Viewer not found: $viewer  (build sibr-co
 
 # --- producer args ---
 $py = @(
-  "motion-drive-render-v43.py",
+  "render_webcam.py",
   "--source", $Source,
   "--identity", $Identity,
   "--estimator", $Estimator,
