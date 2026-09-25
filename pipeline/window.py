@@ -4,6 +4,8 @@ import time
 
 import cv2
 
+from pipeline.overlay import draw_skeleton
+
 
 class SourceWindow:
     """Python-owned OpenCV preview of the driving frame + status overlay.
@@ -29,7 +31,7 @@ class SourceWindow:
         self._t_prev_frame = None
         self._dt_ema = None
 
-    def show(self, frame, status, produce_ms, identity, missing_count):
+    def show(self, frame, status, produce_ms, identity, missing_count, pj2d=None):
         """Render one frame with a status overlay and pump the OpenCV event loop.
 
         @param frame: np.ndarray, BGR frame to display (not modified in place).
@@ -38,6 +40,9 @@ class SourceWindow:
         @param produce_ms: last `produce_frame()` duration in ms, shown in the overlay.
         @param identity: current identity index, shown in the overlay.
         @param missing_count: consecutive missed-detection count, shown in the overlay.
+        @param pj2d: optional (J,2) 2D joint pixel coords (e.g. the estimator's
+            `last_pj2d`, frozen across skip/miss frames by the caller); drawn as a
+            skeleton overlay when given and `args.overlay_skeleton` is truthy.
         @throws KeyboardInterrupt: if the user presses 'q' or Esc, so the
             caller's server loop stops cleanly.
         """
@@ -51,6 +56,8 @@ class SourceWindow:
         self._t_prev_frame = now
 
         disp = frame.copy()
+        if getattr(self.args, "overlay_skeleton", False) and pj2d is not None:
+            draw_skeleton(disp, pj2d)
         fps = (1.0 / self._dt_ema) if self._dt_ema else 0.0
         line1 = f"FPS: {fps:5.1f}   produce: {produce_ms:6.1f} ms   id: {identity}   pose: {status}"
         sp = f" [{self.args.filter_space}]" if self.args.smooth else ""

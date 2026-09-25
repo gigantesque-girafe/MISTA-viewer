@@ -6,6 +6,11 @@ from scipy.spatial.transform import Rotation
 
 from dataset.zjumocap import ZJUMoCapDataset               # for _recompute_bone_transforms
 
+# SMPL-24 kinematic chain (parent index per joint, -1 = root). Shared by the forward
+# kinematics below and by pipeline/overlay.py's 2D skeleton bone-line drawing.
+SMPL_24_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9,
+                    12, 13, 14, 16, 17, 18, 19, 20, 21]
+
 
 def pose_to_camera_fields(smpl_thetas_72, Jtr_target, b02v_inv, device,
                           trans=None, trans_xform=None):
@@ -69,8 +74,7 @@ def smpl_posed_joints(smpl_thetas_72, Jtr_target):
     pose_body = thetas[3:66]
     pose_hand = thetas[66:72]
 
-    parents = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9,
-               12, 13, 14, 16, 17, 18, 19, 20, 21]
+    parents = SMPL_24_PARENTS
     pose_full = np.concatenate([root_orient, pose_body, pose_hand], axis=-1)
     pose_rots = Rotation.from_rotvec(pose_full.reshape([-1, 3])).as_matrix().astype(np.float64)
 

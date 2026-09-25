@@ -164,6 +164,7 @@ class LiveVRSource(VRSource):
         self.n_frames = 1                   # poses are live-sourced, not indexed
 
         self.last_tensors = None            # last produced 5-tuple (freeze on miss/skip)
+        self.last_pj2d = None               # last 2D joints for the skeleton overlay (freeze on miss/skip)
         self._romp_ctr = 0                  # drives --romp-every-n skipping
         self.window = None if args.no_window else SourceWindow(estimator.name, args, frame_source)
 
@@ -247,6 +248,10 @@ class LiveVRSource(VRSource):
             raw_pose, raw_trans = self.estimator.estimate(frame)
             if _PROFILE:
                 _t_est = (time.perf_counter() - _pe) * 1000.0
+            # Freeze the overlay's 2D joints on a miss (mirrors last_tensors below),
+            # so the skeleton holds its last known pose instead of vanishing/flickering.
+            if self.estimator.last_pj2d is not None:
+                self.last_pj2d = self.estimator.last_pj2d
             # Amplify the estimator's own neck+head yaw before smoothing (--head-amplify).
             if self.head_amplify and raw_pose is not None:
                 from pipeline.headpose import amplify_head_yaw
@@ -303,7 +308,8 @@ class LiveVRSource(VRSource):
         # ── 3) Show the source frame (same call => synced with the pose sent) ──
         if self.window is not None:
             self.window.show(frame, status, produce_ms,
-                             self.identity, self.processor.missing_count)
+                             self.identity, self.processor.missing_count,
+                             pj2d=self.last_pj2d)
 
         # ── 4) Hand the 5 attribute tensors to the server for IPC to C++ ──────
         return tensors
@@ -376,6 +382,12 @@ def parse_args():
                    help="TCP port the C++/SIBR viewer connects to (default 6012).")
     p.add_argument("--no-window", action="store_true",
                    help="Disable the Python source-frame window (stream to C++ only).")
+    p.add_argument("--overlay-skeleton", dest="overlay_skeleton", action="store_true",
+                   help="Draw the estimator's 2D joints/skeleton on the source window "
+                        "(default; nearly free, reuses ROMP's already-computed pj2d_org).")
+    p.add_argument("--no-overlay-skeleton", dest="overlay_skeleton", action="store_false",
+                   help="Disable the skeleton overlay; show the plain source frame.")
+    p.set_defaults(overlay_skeleton=True)
     p.add_argument("--romp-every-n", type=int, default=1,
                    help="Run ROMP (and re-deform) every N frames, reusing the last "
                         "pose on the others. 1 = every frame (default). N=2 ~doubles "
